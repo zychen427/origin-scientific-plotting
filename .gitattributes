@@ -1,0 +1,3 @@
+# Preserve exact distribution bytes used by SHA256SUMS.json and source provenance.
+# This disables checkout/check-in newline conversion without disabling text diffs.
+* -text
