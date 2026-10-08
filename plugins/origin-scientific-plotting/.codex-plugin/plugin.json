@@ -1,0 +1,29 @@
+{
+  "name": "origin-scientific-plotting",
+  "version": "0.1.2",
+  "description": "本机Origin科研绘图：数据导入、可编辑图形、样式调整和导出验证。",
+  "author": {
+    "name": "Personal research workspace"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./mcp.json",
+  "interface": {
+    "displayName": "Origin科研绘图",
+    "shortDescription": "控制本地Origin，生成可编辑科研图",
+    "longDescription": "通过Windows本机Origin COM接口导入和读取工作表、创建科研图、调整样式、导出图片与矢量图，并保存可编辑Origin项目。附中文工作流程与验证脚本。需要本机已授权的Origin和Python环境。",
+    "developerName": "Personal research workspace",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "logo": "./assets/logo.png",
+    "composerIcon": "./assets/logo.png",
+    "brandColor": "#2563EB",
+    "defaultPrompt": [
+      "在本地Origin中读取指定文件，核对数据列后绘图，导出预览并保存可编辑项目。",
+      "检查当前Origin工作表和图形，并根据指定要求修改图形样式。",
+      "用明确标注的演示数据验证Origin连接、绘图、导出和项目保存。"
+    ]
+  }
+}

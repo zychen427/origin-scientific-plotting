@@ -1,0 +1,215 @@
+{
+  "checked_at_utc": "2026-10-08T10:43:04.073366+00:00",
+  "plugin_root": "<PLUGIN_ROOT>",
+  "static_validation": {
+    "manifest": "passed",
+    "compatibility": "passed",
+    "icon": "passed",
+    "source_hashes": "passed",
+    "source_file_count": 30
+  },
+  "demo_data": "Synthetic data for plugin verification; not experimental measurements.",
+  "calls": [
+    {
+      "tool": "list_skills",
+      "arguments": {},
+      "is_error": false,
+      "result": "Available origin-pro skills (call get_skill(name) for details):\n\n- labtalk-gotchas: LabTalk Gotchas\n    Use this before writing raw `run_labtalk` scripts, or when a styling/analysis\n- publication-figure: Publication Figure\n    Use this when the user asks for a manuscript figure, publication-quality graph, journal-ready plot, reference-paper style, or polished Origin export."
+    },
+    {
+      "tool": "get_skill",
+      "arguments": {
+        "name": "publication-figure"
+      },
+      "is_error": false,
+      "result": "Full returned skill saved in server_publication_skill.md"
+    },
+    {
+      "tool": "list_worksheets",
+      "arguments": {},
+      "is_error": false,
+      "result": "{\"workbooks\": [], \"graphs\": [], \"matrices\": []}\n\n[origin-mcp] Note: 1 leftover Origin window(s) from earlier sessions are still open (projects: OriginPluginDemo_e6beb7.opju). Close them in the GUI once saved, or set ORIGIN_PRO_MCP_SWEEP_ORPHANS=1 to have restarts clean them."
+    },
+    {
+      "tool": "create_worksheet",
+      "arguments": {
+        "book_name": "PluginDemoaae218",
+        "sheet_name": "DemoData"
+      },
+      "is_error": false,
+      "result": "{\"name\": \"PluginDemoaae\", \"requested_name\": \"PluginDemoaae218\", \"renamed\": true, \"sheet\": \"DemoData\", \"added_to_existing_book\": false}"
+    },
+    {
+      "tool": "set_worksheet_data",
+      "arguments": {
+        "book_name": "PluginDemoaae",
+        "sheet_name": "DemoData",
+        "columns": "[[0, 1, 2, 3, 4, 5, 6, 7, 8], [0.4, 0.7, 1.2, 1.7, 2.1, 2.7, 3.0, 3.6, 4.1], [0.6, 0.9, 1.0, 1.5, 1.9, 2.0, 2.5, 2.9, 3.2]]",
+        "column_names": "Index,Demo A,Demo B"
+      },
+      "is_error": false,
+      "result": "Set 3 columns x 9 rows in [PluginDemoaae]DemoData"
+    },
+    {
+      "tool": "create_graph",
+      "arguments": {
+        "graph_name": "PluginGraphaae218",
+        "data_book": "PluginDemoaae",
+        "data_sheet": "DemoData",
+        "x_col": 1,
+        "y_col": 2,
+        "plot_type": "line+symbol",
+        "title": "Plugin verification: synthetic data"
+      },
+      "is_error": false,
+      "result": "{\"name\": \"PluginGraphaae218\", \"requested_name\": \"PluginGraphaae218\", \"renamed\": false, \"plot_type\": \"line+symbol\", \"template\": null}"
+    },
+    {
+      "tool": "add_plot_to_graph",
+      "arguments": {
+        "graph_name": "PluginGraphaae218",
+        "data_book": "PluginDemoaae",
+        "data_sheet": "DemoData",
+        "x_col": 1,
+        "y_col": 3,
+        "plot_type": "line+symbol"
+      },
+      "is_error": false,
+      "result": "Added line+symbol plot to PluginGraphaae218"
+    },
+    {
+      "tool": "apply_publication_style",
+      "arguments": {
+        "graph_name": "PluginGraphaae218",
+        "x_label": "Index (dimensionless)",
+        "y_label": "Synthetic response (a.u.)",
+        "legend_entries": "Demo A,Demo B",
+        "legend_position": "top-left"
+      },
+      "is_error": false,
+      "result": "Publication style applied to PluginGraphaae218: 2 data plots styled (pastel palette, 3.0 pt lines), Arial bold labels (verified), inward ticks, closed frame, no grid, borderless bold legend (top-left); NOTE: if these plots are GROUPED, per-plot colors may be overridden by the group — call ungroup_plots first if the palette doesn't look right"
+    },
+    {
+      "tool": "export_graph",
+      "arguments": {
+        "graph_name": "PluginGraphaae218",
+        "file_path": "<VERIFICATION_OUTPUT>\\origin-plugin-demo.png",
+        "format": "png",
+        "width": 1600
+      },
+      "is_error": false,
+      "result": "Exported PluginGraphaae218 to <VERIFICATION_OUTPUT>\\origin-plugin-demo.png (1600px wide, 36231 bytes)"
+    },
+    {
+      "tool": "save_project",
+      "arguments": {
+        "file_path": "<VERIFICATION_OUTPUT>\\origin-plugin-demo.opju"
+      },
+      "is_error": false,
+      "result": "Project saved to: <VERIFICATION_OUTPUT>\\origin-plugin-demo.opju"
+    },
+    {
+      "tool": "list_worksheets",
+      "arguments": {},
+      "is_error": false,
+      "result": "{\"workbooks\": [{\"name\": \"PluginDemoaae\", \"sheets\": [\"DemoData\"]}], \"graphs\": [\"PluginGraphaae218\"], \"matrices\": []}"
+    }
+  ],
+  "server_info": {
+    "name": "origin-pro",
+    "title": null,
+    "version": "1.29.1",
+    "websiteUrl": null,
+    "icons": null
+  },
+  "tool_count": 45,
+  "tools": [
+    "add_layer",
+    "add_plot_to_graph",
+    "add_second_y_axis",
+    "annotate",
+    "apply_publication_style",
+    "axis",
+    "colormap",
+    "create_graph",
+    "create_matrix",
+    "create_matrix_plot",
+    "create_worksheet",
+    "curve_fit",
+    "delete_graph",
+    "export_all_graphs",
+    "export_graph",
+    "export_worksheet",
+    "get_labtalk_variable",
+    "get_matrix_data",
+    "get_skill",
+    "get_worksheet_data",
+    "import_data",
+    "list_fitting_functions",
+    "list_skills",
+    "list_worksheets",
+    "load_project",
+    "manage_columns",
+    "new_project",
+    "remove_plot",
+    "run_labtalk",
+    "save_graph_template",
+    "save_project",
+    "set_error_bars",
+    "set_graph_font",
+    "set_layer_geometry",
+    "set_legend",
+    "set_matrix_data",
+    "set_plot_style",
+    "set_tick_labels",
+    "set_worksheet_data",
+    "sort_worksheet",
+    "stats",
+    "transform",
+    "transpose_worksheet",
+    "ungroup_plots",
+    "worksheet_to_matrix"
+  ],
+  "session_notes": [
+    "[origin-mcp] Note: 1 leftover Origin window(s) from earlier sessions are still open (projects: OriginPluginDemo_e6beb7.opju). Close them in the GUI once saved, or set ORIGIN_PRO_MCP_SWEEP_ORPHANS=1 to have restarts clean them."
+  ],
+  "initial_state": {
+    "workbooks": [],
+    "graphs": [],
+    "matrices": []
+  },
+  "protocol_validation": "passed",
+  "final_state": {
+    "workbooks": [
+      {
+        "name": "PluginDemoaae",
+        "sheets": [
+          "DemoData"
+        ]
+      }
+    ],
+    "graphs": [
+      "PluginGraphaae218"
+    ],
+    "matrices": []
+  },
+  "preview_size": [
+    1600,
+    1134
+  ],
+  "artifacts": {
+    "preview": {
+      "path": "<VERIFICATION_OUTPUT>\\origin-plugin-demo.png",
+      "bytes": 36231,
+      "sha256": "4dd101fca6e6cd60981fce582487b71f37c31b56b42b261ecdb9fdb51ced2d94"
+    },
+    "project": {
+      "path": "<VERIFICATION_OUTPUT>\\origin-plugin-demo.opju",
+      "bytes": 31840,
+      "sha256": "285d521e6c571d37a4ab44d91cbfea4339295f1a20f53904974b4a30e80892c5"
+    }
+  },
+  "native_plot_validation": "passed",
+  "status": "passed",
+  "publication_note": "Public copy of the actual Windows verification record. Local installation/output paths replaced with placeholders; demo filenames made stable. Original PNG and OPJU bytes preserved."
+}

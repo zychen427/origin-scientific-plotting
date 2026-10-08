@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local Origin plugin configuration and test output
+.local-config/
+verification/
+*.env

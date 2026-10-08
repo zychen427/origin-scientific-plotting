@@ -1,0 +1,4 @@
+interface:
+  display_name: "Origin科研绘图"
+  short_description: "控制本地Origin并验证可编辑科研图"
+  default_prompt: "请在本地Origin中核对指定数据并绘图，导出预览并保存可编辑项目。"

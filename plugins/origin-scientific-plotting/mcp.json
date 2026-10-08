@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "origin-scientific-plotting": {
+      "type": "stdio",
+      "command": "G:\\Codex\\projects\\Origin-Pro-MCP\\.venv\\Scripts\\python.exe",
+      "args": [
+        "${PLUGIN_ROOT}/server/launch.py"
+      ],
+      "cwd": "${PLUGIN_ROOT}",
+      "env": {
+        "ORIGIN_PRO_MCP_VISIBLE": "1",
+        "ORIGIN_PRO_MCP_USE_DAEMON": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      }
+    }
+  }
+}

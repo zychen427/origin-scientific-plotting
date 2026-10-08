@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "origin-pro-mcp"
+version = "0.3.1"
+description = "MCP server for controlling OriginLab Origin Pro via COM automation"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "youngminsw" },
+]
+keywords = ["mcp", "origin", "originlab", "originpro", "com", "automation", "plotting"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dependencies = [
+    "mcp>=1.0.0,<2",
+    "pywin32>=306; platform_system == 'Windows'",
+    "Pillow>=10.0.0",
+]
+
+[project.scripts]
+origin-pro-mcp = "origin_pro_mcp.app:main"
+origin-pro-cli = "origin_pro_mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/youngminsw/Origin-Pro-MCP"
+Repository = "https://github.com/youngminsw/Origin-Pro-MCP"
+Issues = "https://github.com/youngminsw/Origin-Pro-MCP/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/origin_pro_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/origin_pro_mcp", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

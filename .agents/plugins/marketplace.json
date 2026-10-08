@@ -1,0 +1,17 @@
+{
+  "name": "origin-research-local",
+  "plugins": [
+    {
+      "name": "origin-scientific-plotting",
+      "source": {
+        "source": "local",
+        "path": "./plugins/origin-scientific-plotting"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
