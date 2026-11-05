@@ -44,4 +44,6 @@ codex plugin add origin-scientific-plotting@origin-research-local
 
 ## 安装包
 
-`packages/origin-scientific-plotting-0.1.2.zip`包含一个完整插件目录及隐藏兼容清单，保留此次本机验证配置。迁移到另一台机器前，应展开并配置其`mcp.json`，或使用仓库中的配置脚本配置检出目录后重新打包。解释器、虚拟环境与Origin许可证需要在本机自行提供。
+`packages/origin-scientific-plotting-0.2.1.zip`包含一个完整插件目录及隐藏兼容清单，使用可移植的解释器占位配置。迁移到另一台机器前，应展开并配置其`mcp.json`，或使用仓库中的配置脚本配置检出目录后重新打包。解释器、虚拟环境与Origin许可证需要在本机自行提供。
+
+0.2.1 默认关闭现有项目自动保存和对话框自动关闭；启动器默认使用单独的用户目录 daemon 锁文件。需先停止旧版本的后台服务后再核验更新效果。

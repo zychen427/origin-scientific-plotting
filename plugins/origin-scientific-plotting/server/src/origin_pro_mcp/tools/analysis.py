@@ -150,15 +150,12 @@ def _interpolate_impl(
     x_min, x_max = min(xvals), max(xvals)
     step = (x_max - x_min) / (safe_n - 1) if safe_n > 1 else 0
     o = get_origin()
-    # Reuse a single stable "Interp" book (overwrite) instead of spawning a new
-    # Interp/Interp1/Interp2... on every call (item 11 orphan hygiene). Clear
-    # its rows first so a smaller num_points can't leave stale tail rows.
-    out_name = "Interp"
-    created = out_name not in workbook_names()
-    if created:
-        out_name = o.CreatePage(2, "Interp", "origin")
-    else:
-        execute_labtalk(f'win -a {out_name}; page.active$ = "Sheet1"; wks.nrows = 0;')
+    # Always create a new result workbook. Origin uniquifies this name if the
+    # user already has an Interp book; never clear an existing workbook.
+    out_name = o.CreatePage(2, "Interp", "origin")
+    if not out_name:
+        raise ValueError("Origin could not create an interpolation result workbook.")
+    created = True
     execute_labtalk(f'win -a {out_name}; page.active$ = "Sheet1"; col(1) = data({x_min}, {x_max}, {step});')
     cmd = (
         f"interp1 ix:=[{out_name}]Sheet1!col(1) "

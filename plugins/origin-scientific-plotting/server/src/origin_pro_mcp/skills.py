@@ -30,7 +30,10 @@ SKILL_TOOL_NAMES = ("list_skills", "get_skill")
 # making the skills mandatory reference rather than an optional tool.
 SERVER_INSTRUCTIONS = (
     "This server controls OriginLab Origin Pro and ships expert skills that "
-    "encode how to produce high-quality results. BEFORE you create or style any "
+    "encode how to produce high-quality results. Before each new plot, load "
+    "plot-preflight and plan the chart, data structure, transformations, "
+    "mapping, and verification; check imported data matches the plot. "
+    "BEFORE you create or style any "
     "figure or plot, or run any analysis, you MUST first call `list_skills`, "
     "then `get_skill(<name>)` to load the relevant skill, and follow its steps "
     "— do not work from memory alone. For any manuscript / journal / "

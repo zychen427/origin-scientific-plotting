@@ -11,7 +11,7 @@ Use this when the user asks for a manuscript figure, publication-quality graph, 
 - Windows with a licensed Origin/OriginPro installation
 - `origin-pro` MCP launched by the MCP client through Windows Python
 - Prefer typed MCP tools over raw LabTalk
-- Use `run_labtalk` for advanced graph and analysis commands; destructive and file-writing commands are blocked. If a multi-statement script fails as a whole, the server automatically retries it statement-by-statement and reports each one's OK/FAILED status — proactively splitting a script into small chunks is still fine, but no longer required to see which statement caused a failure
+- Use `run_labtalk` for advanced graph and analysis commands; destructive and file-writing commands are blocked. If a multi-statement script fails, it may have partially executed; inspect the project before retrying. Split non-idempotent operations into separately verified calls
 - Verified on Origin Pro 2020 only; other versions may work but are not verified by this skill
 
 ## First Pass
@@ -37,14 +37,7 @@ If unspecified, choose a conservative manuscript default: line+symbol for ordere
 - `apply_publication_style` defaults are tuned for print: 3.0 pt data
   lines, size-14 symbols, and 2.5 pt error-bar lines with whisker caps
   matched to the symbol size.
-- **Axis rules (strict — `apply_publication_style` enforces these):**
-  - **No empty axis gap on a linear graph.** The axis range is TIGHT to the
-    data — no padding before the first or after the last point. If the data
-    starts at 0, the axis starts at 0 (0 is the Y-intercept; the curve touches
-    the Y axis). Never leave a blank stretch where there is no data.
-  - **Major ticks capped at 4–6 per axis.** Never crowd the axis with ticks;
-    the tool picks a round increment giving ≤6 labelled ticks, with sparse
-    minor ticks. If you set ranges manually, keep within 4–6 major ticks.
+- Preserve existing axis ranges by default. Set explicit bounds only when appropriate; include error bars and avoid truncating important data. Column charts normally need a meaningful zero baseline. Check ticks for readability.
 - **Keep the project lightweight — delete bad graphs.** When a figure comes
   out wrong (mis-scaled, wrong plot type, rejected attempt), remove it with
   the `delete_graph` tool instead of leaving it in the project. A project full
@@ -58,7 +51,7 @@ If unspecified, choose a conservative manuscript default: line+symbol for ordere
   make room.** The tool reports `outside-right` and "moved outside the frame
   to avoid the data" when this happens; no manual step is needed. (A dense
   scatter that fills all four corners is the usual trigger.)
-- Legends: borderless with bold entries (the style tools do this).
+- Legends: borderless; verify bold styling visually. Explicit legend entries modify source column long names.
 - Use distinct symbols when colors alone may not survive grayscale printing.
 - Keep axis ranges tight but honest; do not crop important outliers.
 - Use legends only when labels cannot be placed directly or series count requires it.
@@ -110,10 +103,10 @@ heatmaps, and 3D scatter.
   to a continuous look while KEEPING the colorbar). That gives matplotlib-style
   continuous-map-plus-colorbar in a single Origin graph — no PPT compositing.**
   To match the rest of the
-  figure (figA-style bold Arial), drive the `Spectrum1` object via
+  figure (figA-style bold Times New Roman), drive the `Spectrum1` object via
   `run_labtalk`. **The numeric labels only honour `bold`/`font` after you turn
   off auto-display first:**
-  `Spectrum1.labels.autodisp=0; Spectrum1.labels.bold=1; Spectrum1.labels.fsize=14; Spectrum1.labels.font=font(Arial); Spectrum1.barthick=130;`
+  `Spectrum1.labels.autodisp=0; Spectrum1.labels.bold=1; Spectrum1.labels.fsize=14; Spectrum1.labels.font=font(Times New Roman); Spectrum1.barthick=130;`
   Keep the numeric labels SHORT — set the format explicitly so you don't get
   `0.5000`/`1.000`: `Spectrum1.labels.numdisp=1; Spectrum1.labels.decplaces=1;`
   (→ `0.0, 0.5, 1.0`). Pin the over/under-range colors to the map's ends so the
@@ -125,7 +118,7 @@ heatmaps, and 3D scatter.
   the real data range; don't clip features into saturation just to boost
   contrast, and state the range.
 - **Label every axis with units, including Z — and make EVERY text element
-  bold Arial, not just X/Y.** The skill's reference figures bold all titles
+  bold Times New Roman, not just X/Y.** The skill's reference figures bold all titles
   and tick labels; a half-bolded figure looks inconsistent. On 3D plots the
   axis-title objects are `xb` (X), `yl` (Y) and **`zf` (Z)** — note `zl`/`zt`
   silently no-op for the OpenGL Z title — so bold the Z title with

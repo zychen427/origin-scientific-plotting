@@ -147,12 +147,12 @@ def _set_axis_title_verified(
     graph_name: str, obj: str, label_text: str, font_size: int = 28
 ) -> bool:
     """Write an axis-title text object (``xb`` bottom-X / ``yl`` left-Y), bold
-    Arial, then CONFIRM it landed by reading ``<obj>.text$`` back.
+    Times New Roman, then CONFIRM it landed by reading ``<obj>.text$`` back.
 
     Origin's active-window text-object writes can silently hit the wrong window
     or no-op on the new-page settle race — the exact bug that left
     apply_publication_style's titles reading back as the ``%(?X)`` column-name
-    placeholder while the tool claimed "Arial bold labels" (usability agent,
+    placeholder while the tool claimed "Times New Roman bold labels" (usability agent,
     3/3). LabTalk returns success either way, so success is gated on the
     read-back actually containing the label words, with an activate + settle
     retry. Returns True when verified, False otherwise (caller must NOT claim
@@ -161,7 +161,7 @@ def _set_axis_title_verified(
     for attempt in range(3):
         activate_window(graph_name, "graph_name")
         execute_labtalk(
-            f'{obj}.text$ = {safe}; {obj}.fsize = {font_size}; {obj}.font$ = "Arial";'
+            f'{obj}.text$ = {safe}; {obj}.fsize = {font_size}; {obj}.font$ = "Times New Roman";'
         )
         got = get_lt_str(f"{obj}.text$") or ""
         if label_text in got:
@@ -493,13 +493,14 @@ def apply_publication_style(
     y_min: float | None = None,
     y_max: float | None = None,
     legend_entries: str = "",
-    legend_position: str = "top-right"
+    legend_position: str = "top-right",
+    modify_source_labels: bool = False
 ) -> str:
     """Apply complete publication styling to a graph in ONE call.
 
-    Sets bold Arial labels, a muted pastel color palette, 2.5 pt lines,
+    Sets bold Times New Roman labels, a muted pastel color palette, 2.5 pt lines,
     readable tick spacing, inward ticks, closed frame, and a borderless
-    bold legend all at once. Designed to minimize token usage — call this
+    legend all at once. Designed to minimize token usage — call this
     once instead of many separate tools.
 
     NOTE: per-curve COLOR, WIDTH, and SYMBOL all apply only on UNGROUPED plots
@@ -514,16 +515,19 @@ def apply_publication_style(
         graph_name: Graph name
         x_label: X axis label with units, e.g. "Temperature (K)"
         y_label: Y axis label with units, e.g. "Absorbance (a.u.)"
-        x_min: X axis minimum (None=auto)
-        x_max: X axis maximum (None=auto)
-        y_min: Y axis minimum (None=auto)
-        y_max: Y axis maximum (None=auto)
-        legend_entries: Comma-separated legend entries, e.g. "Sample A,Sample B"
+        x_min: X axis minimum (None=preserve current bound)
+        x_max: X axis maximum (None=preserve current bound)
+        y_min: Y axis minimum (None=preserve current bound)
+        y_max: Y axis maximum (None=preserve current bound)
+        legend_entries: Comma-separated entries; changes source worksheet column Long Names.
+        modify_source_labels: Must be True to permit that source-column change.
         legend_position: top-left, top-right, bottom-left, bottom-right
 
     Returns:
         Summary of applied styling
     """
+    if legend_entries and not modify_source_labels:
+        raise ValueError("Custom legend entries change source column Long Names; pass modify_source_labels=True only if that change is intended.")
     safe_graph_name = labtalk_name(graph_name, "graph_name")
     safe_legend_position = labtalk_choice(
         legend_position,
@@ -534,10 +538,10 @@ def apply_publication_style(
     activate_window(safe_graph_name, "graph_name")
     plot_infos = get_plot_info(safe_graph_name)
 
-    # 1. Axis titles — bold, Arial 28pt. Written through the read-back-gated
+    # 1. Axis titles — bold, Times New Roman 28pt. Written through the read-back-gated
     # helper: the old bare active-window writes silently dropped the labels on
     # the settle race (titles stayed the %(?X) column-name placeholder) while
-    # the return still claimed "Arial bold labels". label_unverified collects
+    # the return still claimed "Times New Roman bold labels". label_unverified collects
     # any axis whose title could not be confirmed so the return tells the truth.
     label_unverified: list[str] = []
     if x_label:
@@ -555,20 +559,23 @@ def apply_publication_style(
     # return rather than aborting the whole call.
     cosmetic_notes: list[str] = []
 
-    # 2. Tick labels — bold, Arial 22pt (cosmetic)
+    # 2. Tick labels — bold, Times New Roman 22pt (cosmetic)
     if not graph_layer_execute(safe_graph_name, 'layer.x.label.pt = 22; layer.y.label.pt = 22;'):
         cosmetic_notes.append("tick-label size")
     if not graph_layer_execute(safe_graph_name, 'layer.x.label.bold = 1; layer.y.label.bold = 1;'):
         cosmetic_notes.append("tick-label bold")
+    if not graph_layer_execute(safe_graph_name, 'layer.x.label.font = font(Times New Roman); layer.y.label.font = font(Times New Roman);'):
+        cosmetic_notes.append("tick-label font family")
 
-    # 3. Axis range — TIGHT to the data by default (no empty gap before the
-    # first or after the last point; if the data starts at 0 the axis starts
-    # at 0) + readable tick spacing (~4 major intervals). Explicit min/max
-    # override the data extent. Best-effort: unreadable data leaves the axis
-    # on Origin's auto range.
-    range_cmds = _tight_axis_cmds(safe_graph_name, x_min, x_max, y_min, y_max)
-    if range_cmds:
-        graph_layer_execute(safe_graph_name, " ".join(range_cmds))
+    # Preserve existing axis ranges; only explicit bounds are applied.
+    for axis_name, lower, upper in (("x", x_min, x_max), ("y", y_min, y_max)):
+        parts = []
+        if lower is not None:
+            parts.append(f"layer.{axis_name}.from = {float(lower)};")
+        if upper is not None:
+            parts.append(f"layer.{axis_name}.to = {float(upper)};")
+        if parts and not graph_layer_execute(safe_graph_name, " ".join(parts)):
+            raise ValueError(f"Could not set {axis_name}-axis range on {safe_graph_name}.")
 
     # 4. Ticks — inward, minor ticks on, proper lengths (structural → raise)
     if not graph_layer_execute(safe_graph_name,
@@ -629,7 +636,7 @@ def apply_publication_style(
             graph_layer_execute(safe_graph_name, f"set {pname} -cf {current_color};")
         time.sleep(0.2)
 
-    # 8. Legend — reconstruct, then customize: bold entries, no border
+    # 8. Legend — reconstruct; do not mutate source labels by default.
     execute_labtalk(f"win -a {safe_graph_name}; legend -r;")
     time.sleep(0.3)
 
@@ -637,21 +644,7 @@ def apply_publication_style(
         entry_list = [f"\\b({e.strip()})" for e in legend_entries.split(",")]
         set_legend_entries(safe_graph_name, entry_list)
         time.sleep(0.3)
-    else:
-        # Bold the auto legend (from column long names) for consistency
-        renamed = False
-        for info in plot_infos:
-            if info["is_error"]:
-                continue
-            col = find_plot_column(info["name"])
-            if col is not None and col.LongName and not col.LongName.startswith("\\b("):
-                col.LongName = f"\\b({col.LongName})"
-                renamed = True
-        if renamed:
-            execute_labtalk(f"win -a {safe_graph_name}; legend -r;")
-            time.sleep(0.3)
-
-    execute_labtalk('legend.fsize = 20; legend.font$ = "Arial"; legend.background = 0;')
+    execute_labtalk('legend.fsize = 20; legend.font$ = "Times New Roman"; legend.background = 0;')
     placement = place_legend_avoiding_data(safe_graph_name, safe_legend_position)
 
     moved_out = " — moved outside the frame to avoid the data" if placement.startswith("outside") else ""
@@ -681,16 +674,16 @@ def apply_publication_style(
         )
     requested_labels = [a for a, lbl in (("x", x_label), ("y", y_label)) if lbl]
     if not requested_labels:
-        labels_phrase = "Arial bold labels"
+        labels_phrase = "Times New Roman bold labels"
     elif label_unverified:
         labels_phrase = (
-            f"Arial bold ticks (WARNING: the {', '.join(label_unverified)}-axis "
+            f"Times New Roman bold ticks (WARNING: the {', '.join(label_unverified)}-axis "
             f"label(s) could NOT be verified — Origin read them back unchanged, "
             f"so they were most likely dropped; set them again with "
             f"axis(op='labels'))"
         )
     else:
-        labels_phrase = "Arial bold labels (verified)"
+        labels_phrase = "Times New Roman bold labels (text verified; font rendering requires visual check)"
     cosmetic_note = (
         f"; NOTE: these cosmetic steps did not take: {', '.join(cosmetic_notes)}"
         if cosmetic_notes else ""
@@ -745,7 +738,7 @@ def _bold_text_object(obj: str) -> None:
 @mcp.tool()
 def set_graph_font(
     graph_name: str,
-    font_name: str = "Arial",
+    font_name: str = "Times New Roman",
     font_size: int = 24,
     target: str = "all",
     bold: bool = False,
@@ -754,7 +747,7 @@ def set_graph_font(
 
     Args:
         graph_name: Graph name
-        font_name: Font family (e.g., Arial)
+        font_name: Font family (default Times New Roman)
         font_size: Font size in points (default 24)
         target: "all", "axes", "title", "legend", "tick"
         bold: Bold the targeted element(s). Axis titles and the graph title are
@@ -772,7 +765,7 @@ def set_graph_font(
     is silently frozen.
 
     Returns:
-        Success message
+        Success message; font family should be visually checked on the target Origin version.
     """
     safe_graph_name = labtalk_name(graph_name, "graph_name")
     safe_font_name = labtalk_string(font_name, "font_name")
@@ -800,6 +793,8 @@ def set_graph_font(
         _verify_text_fsize("yl", safe_font_size, "y-axis title", safe_graph_name)
 
     if safe_target in ("all", "tick"):
+        if not graph_layer_execute(safe_graph_name, f"layer.x.label.font = font({safe_font_name}); layer.y.label.font = font({safe_font_name});"):
+            raise ValueError(f"Could not set tick-label font family on {safe_graph_name}.")
         tick_size = max(safe_font_size - 4, 16)
         if not graph_layer_execute(safe_graph_name, f"layer.x.label.pt = {tick_size}; layer.y.label.pt = {tick_size};"):
             msg = f"Could not set tick label font size on {safe_graph_name}."
@@ -835,7 +830,8 @@ def set_legend(
     graph_name: str,
     visible: bool = True,
     position: str = "top-right",
-    entries: str = ""
+    entries: str = "",
+    modify_source_labels: bool = False
 ) -> str:
     """Configure graph legend.
 
@@ -843,7 +839,8 @@ def set_legend(
         graph_name: Graph name
         visible: Show or hide legend
         position: top-left, top-right, bottom-left, bottom-right
-        entries: Comma-separated custom legend entries
+        entries: Comma-separated custom legend entries; changes source column Long Names.
+        modify_source_labels: Must be True to permit that source-column change.
 
     On a graph loaded from a .opju the legend rebuild is read back (the legend
     object's presence is confirmed) — live-verified reliable once the page is
@@ -852,6 +849,8 @@ def set_legend(
     Returns:
         Success message
     """
+    if entries and not modify_source_labels:
+        raise ValueError("Custom legend entries change source column Long Names; pass modify_source_labels=True only if that change is intended.")
     safe_graph_name = labtalk_name(graph_name, "graph_name")
     safe_position = labtalk_choice(position, {"top-left", "top-right", "bottom-left", "bottom-right"}, "position")
     require_graph(safe_graph_name)

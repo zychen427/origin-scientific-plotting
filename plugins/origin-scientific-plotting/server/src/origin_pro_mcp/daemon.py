@@ -478,22 +478,13 @@ class Session:
     def force_close(self) -> None:
         """Best-effort teardown of a half-started session (rollback path).
 
-        Signals the worker to stop and closes the instance if one exists, so a
-        start-timeout/start-failure never leaks an untracked Origin process. It
-        never joins (the worker may be wedged in the factory).
+        Signals the worker to stop without closing Origin. A busy or partially
+        started Origin may remain running and must be inspected separately.
         """
         self._queue.put(self._STOP)
-        inst = self.instance
-        if inst is None:
-            return
-        for closer in ("Exit", "Close"):
-            fn = getattr(inst, closer, None)
-            if callable(fn):
-                try:
-                    fn()
-                except Exception:
-                    pass
-                break
+        # Never call Exit/Close from the watchdog thread: a COM instance can
+        # be shared or contain unsaved work. The worker will stop if it returns.
+        return
 
 
 # --------------------------------------------------------------------------- #
@@ -526,7 +517,7 @@ class Pool:
         # ATTACH mode: at most ONE session may attach to the user's already-open
         # Origin (the shared ApplicationSI instance). A second SI attach would
         # share that one instance and collide, so only the first is honored;
-        # later attach requests fall back to an isolated instance.
+        # later attach requests fail without opening another instance.
         self._attach_factory = attach_factory
         self._attach_get_pid = attach_get_pid
         self._attach_session_id: Optional[str] = None
@@ -557,10 +548,11 @@ class Pool:
                 self._sessions.pop(session_id, None)
             if len(self._sessions) >= self._max_size:
                 raise PoolFull(self._full_message())
-            use_attach = (
-                attach and self._attach_factory is not None
-                and self._attach_session_id in (None, session_id)
-            )
+            if attach and self._attach_factory is None:
+                raise RuntimeError("Attach requested but unavailable; no Origin instance was opened. Check the server configuration.")
+            if attach and self._attach_session_id not in (None, session_id):
+                raise RuntimeError("Attach requested but another MCP session owns the attach slot; no separate Origin instance was opened.")
+            use_attach = bool(attach)
             factory = self._attach_factory if use_attach else self._factory
             get_pid = self._attach_get_pid if use_attach else self._get_pid
             session = Session(
@@ -1344,9 +1336,10 @@ class Daemon:
             self._reaping[session_id] = session
         # An unknown PID stays None here -> the watchdog skips the kill but
         # still frees the slot. NEVER substitute os.getpid().
-        pid = session.pid
+        # A disconnected client does not authorize termination of Origin.
+        # The watchdog can release the slot but must never kill this PID.
         if self._watchdog is not None:
-            self._watchdog.arm(session_id, pid,
+            self._watchdog.arm(session_id, None,
                                self._clock() + self._reap_grace)
         session.submit_reap(
             self._recovery_dir, self._project_path_getter,
@@ -1821,6 +1814,14 @@ class Daemon:
         ticket = {"conn": conn, "request_id": request_id, "done": False,
                   "answered": False, "timeout": timeout, "grace": grace}
         with self._dispatch_lock:
+            previous = self._dispatch_tickets.get(session_id)
+            if previous is not None and not previous.get("done"):
+                self._safe_send(conn, {
+                    "type": "response", "request_id": request_id, "ok": False,
+                    "result": None,
+                    "error": "A previous Origin operation is still in progress; no new operation was queued. Inspect its result before retrying.",
+                })
+                return
             self._dispatch_tickets[session_id] = ticket
 
         def _reply(response, sid=session_id, tk=ticket):
@@ -1847,8 +1848,11 @@ class Daemon:
             # Soft notify: pid=None => the watchdog will NOT kill, only warn.
             self._watchdog.arm(session_id, None, now + timeout,
                                reason="dispatch-warn", callback=self._on_dispatch_warn)
-        self._watchdog.arm(session_id, session.pid, now + timeout + grace,
-                            reason="dispatch", callback=self._on_dispatch_timeout)
+        # Do not kill or discard the Origin session on a slow COM call. The
+        # soft warning answers the client; the worker remains bound until done.
+        if grace <= 0:
+            self._watchdog.arm(session_id, None, now + timeout,
+                               reason="dispatch-warn", callback=self._on_dispatch_warn)
         session.submit(request_id, name, kwargs, _reply)
 
     def _dialog_note(self, session_id: str) -> Optional[str]:
@@ -1889,21 +1893,10 @@ class Daemon:
             request_id = ticket["request_id"]
             soft = ticket.get("timeout", self._dispatch_timeout)
             grace = ticket.get("grace", 0.0)
-        if note is not None:
-            # Definitive: the watchdog saw (and usually already closed) the exact
-            # dialog. No "most likely" hedging — name it so the agent acts right.
-            error = (f"Origin has not responded for {soft:.0f}s. {note} If Origin "
-                     f"stays stuck it is force-reset (restarted) in about "
-                     f"{grace:.0f}s and unsaved changes in this session may be lost.")
-        else:
-            error = (
-                f"Origin has not responded for {soft:.0f}s — it is most likely "
-                "showing a MODAL DIALOG (e.g. 'Get MiKTeX Path', a font or import "
-                "prompt, or an error box) that blocks all automation. Switch to the "
-                "Origin window and close/confirm any open dialog: the operation "
-                "then finishes on its own and this session keeps working. If Origin "
-                f"stays stuck it is force-reset (restarted) in about {grace:.0f}s "
-                "and unsaved changes in this session may be lost.")
+        detail = f" {note}" if note else " Check Origin for a dialog or a long operation."
+        error = (f"Origin has not responded for {soft:.0f}s.{detail} "
+                 "The operation may still complete; no window was closed and "
+                 "the result is unknown. Inspect the project before retrying.")
         self._safe_send(conn, {
             "type": "response", "request_id": request_id, "ok": False,
             "result": None, "error": error,
@@ -2352,7 +2345,11 @@ def _real_origin_factory():
     pid: Optional[int] = None
     with _LAUNCH_LOCK:
         before = _origin_process_pids()
-        instance = win32com.client.DispatchEx("Origin.Application")
+        try:
+            instance = win32com.client.DispatchEx("Origin.Application")
+        except Exception as exc:
+            from .origin_connection import explain_com_error
+            raise RuntimeError(explain_com_error(exc)) from exc
         # DispatchEx returns once the server is connectable, but the process may
         # take a moment to appear in the task list — poll briefly.
         deadline = time.monotonic() + 10.0
@@ -2427,11 +2424,15 @@ def resolve_get_pid(factory: OriginFactory) -> Optional[GetPid]:
 def _attach_origin_factory():
     """ATTACH factory: connect to the user's already-open Origin via the shared
     single-instance automation server (``Origin.ApplicationSI``) — verified to
-    attach to a running instance and see its project, not spawn a fresh one.
+    attach to a running instance; if none exists Origin can launch a new one.
     On non-Windows this raises when invoked."""
     import win32com.client  # Windows-only; imported lazily on the worker thread
 
-    inst = win32com.client.Dispatch("Origin.ApplicationSI")
+    try:
+        inst = win32com.client.Dispatch("Origin.ApplicationSI")
+    except Exception as exc:
+        from .origin_connection import explain_com_error
+        raise RuntimeError(explain_com_error(exc)) from exc
     try:
         inst.Visible = _origin_visible()
     except Exception:

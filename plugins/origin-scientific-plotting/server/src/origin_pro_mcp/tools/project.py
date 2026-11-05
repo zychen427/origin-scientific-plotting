@@ -1,5 +1,6 @@
 import os
 import shutil
+import uuid
 
 from ..app import mcp
 from ..origin_connection import (
@@ -31,20 +32,21 @@ def _project_page_count(o) -> int:
 
 
 def _backup_existing(path: str):
-    """Copy an existing non-empty project file to ``<path>.bak`` before it may be
-    overwritten (N5 safety net). Returns the backup path, or None."""
+    """Keep a unique backup before overwriting; fail rather than overwrite unprotected."""
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return None
+    bak = path + "." + uuid.uuid4().hex[:12] + ".bak"
     try:
-        if os.path.isfile(path) and os.path.getsize(path) > 0:
-            bak = path + ".bak"
-            shutil.copy2(path, bak)
-            return bak
-    except OSError:
-        pass
-    return None
+        shutil.copy2(path, bak)
+    except OSError as exc:
+        raise ValueError(f"Cannot back up existing project; no overwrite attempted: {path}") from exc
+    return bak
 
 @mcp.tool()
-def new_project() -> str:
-    """Create a new empty Origin project (closes current without saving)."""
+def new_project(replace_current: bool = False) -> str:
+    """Create an empty project. replace_current=True explicitly permits replacing the current session contents; save them first."""
+    if not replace_current:
+        raise ValueError("Replacing the current project may discard unsaved work; save it and pass replace_current=True to continue.")
     o = get_origin()
     o.NewProject()
     remember_project_path(None)  # a fresh project has no on-disk path to recover
@@ -110,26 +112,25 @@ def save_project(file_path: str = "") -> str:
     return "Project saved"
 
 @mcp.tool()
-def load_project(file_path: str) -> str:
+def load_project(file_path: str, replace_current: bool = False) -> str:
     """Open an Origin project file. Replaces the current project.
 
     Args:
         file_path: Path to a .opj or .opju file (Windows or WSL style)
+        replace_current: Explicitly permit replacing current project contents; save them first.
 
     Returns:
         Success message
     """
-    o = get_origin()
     path = windows_path(file_path, "file_path")
     # Check before calling Load: a failed Load can still discard the
     # currently open project, so a typo must not reach Origin.
     if not os.path.isfile(path):
         msg = f"Project file not found: {path}"
         raise ValueError(msg)
-    # Keep one pre-load backup of the target (N5 safety net). o.Load is
-    # read-only, but a backup guarantees the file is recoverable no matter what
-    # a later save/autosave does in a crash-recovery sequence.
-    _backup_existing(path)
+    if not replace_current:
+        raise ValueError("Loading replaces the current project and may discard unsaved work; save it and pass replace_current=True to continue.")
+    o = get_origin()
     if not o.Load(path):
         msg = f"Origin could not open the project file: {path}"
         raise ValueError(msg)

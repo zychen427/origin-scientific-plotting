@@ -135,24 +135,37 @@ def set_worksheet_data(
         msg = "columns must be a non-empty JSON array of non-empty arrays, e.g. [[1,2,3],[4,5,6]]."
         raise ValueError(msg)
 
-    # (column_index, row_index) pairs, 0-based, to be written as Origin
-    # missing values via LabTalk after the bulk numeric write below.
+    # Validate every column and label before making the first data write.
+    # COM may still fail during a write, so runtime failures report partial state.
     missing_cells: list[tuple[int, int]] = []
+    prepared_columns = []
     for i, col_data in enumerate(cols):
         float_data = []
-        for r, x in enumerate(col_data):
-            if x is None or (isinstance(x, float) and math.isnan(x)):
-                missing_cells.append((i, r))
-                float_data.append(0.0)  # placeholder, overwritten below
-                continue
+        for r, value in enumerate(col_data):
+            if isinstance(value, bool):
+                raise ValueError(f"Column {i + 1} row {r + 1} is boolean, not a numeric measurement.")
+            if value is None:
+                missing_cells.append((i, r)); float_data.append(0.0); continue
             try:
-                float_data.append(float(x))
-            except (TypeError, ValueError) as exc:
-                msg = f"Column {i + 1} contains non-numeric values; only numbers are supported."
-                raise ValueError(msg) from exc
-        if not o.PutWorksheet(target, float_data, 0, i):
-            msg = f"Origin rejected the data for column {i + 1} of {target}."
-            raise ValueError(msg)
+                number = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"Column {i + 1} row {r + 1} is not numeric; no data was written.") from exc
+            if math.isnan(number):
+                missing_cells.append((i, r)); float_data.append(0.0)
+            elif not math.isfinite(number):
+                raise ValueError(f"Column {i + 1} row {r + 1} is infinite; no data was written.")
+            else:
+                float_data.append(number)
+        prepared_columns.append(float_data)
+    prepared_names = [labtalk_text(n.strip(), 'column_names')
+                      for n in column_names.split(",")] if column_names else []
+    for i, float_data in enumerate(prepared_columns):
+        try:
+            accepted = o.PutWorksheet(target, float_data, 0, i)
+        except Exception as exc:
+            raise RuntimeError(f"Writing column {i + 1} of {target} failed; that column or earlier columns may already have changed. Inspect the worksheet.") from exc
+        if not accepted:
+            raise ValueError(f"Origin rejected column {i + 1} of {target}; earlier columns may already have changed. Inspect the worksheet.")
 
     if missing_cells:
         # The bulk PutWorksheet above already wrote a numeric 0.0 placeholder
@@ -189,11 +202,11 @@ def set_worksheet_data(
             raise ValueError(msg)
 
     if column_names:
-        names = [n.strip() for n in column_names.split(",")]
         activate_window(safe_book_name, "book_name")
         execute_labtalk(f'page.active$ = {labtalk_string(safe_sheet_name, "sheet_name")};')
-        for i, name in enumerate(names):
-            execute_labtalk(f"wks.col{i+1}.lname$ = {labtalk_text(name, 'column_names')};")
+        for i, name in enumerate(prepared_names):
+            if not execute_labtalk(f"wks.col{i+1}.lname$ = {name};"):
+                raise ValueError(f"Could not set column {i + 1} name in {target}; data and earlier names may already have changed.")
 
     n_rows = max(len(c) for c in cols)
     return f"Set {len(cols)} columns x {n_rows} rows in {target}"
@@ -717,18 +730,26 @@ def _import_excel_impl(file_path: str, book_name: str = "") -> str:
         <book_name if given, else null>, "renamed": <bool, true if the
         actual name differs from the requested name>, "file": <file_path>}
     """
-    o = get_origin()
     path = windows_path(file_path, "file_path")
     if not os.path.isfile(path):
-        msg = f"File not found: {path}"
-        raise ValueError(msg)
+        raise ValueError(f"File not found: {path}")
+    requested_name = labtalk_name(book_name, "book_name") if book_name else None
+    o = get_origin()
+    previous_books = set(workbook_names())
+    if requested_name and requested_name in previous_books:
+        raise ValueError(f"Workbook name {requested_name} already exists; Excel import was not attempted.")
+    # impExcel can overwrite and rename the ACTIVE workbook. Always put it on
+    # a newly created sacrificial page, never on the user's existing workbook.
+    scratch = o.CreatePage(2, "MCPExcelImport", "origin")
+    if not scratch or scratch in previous_books:
+        raise RuntimeError("Could not create a distinct Excel import workbook; import was not attempted.")
+    activate_window(scratch, "import workbook")
     if not execute_labtalk(f"impExcel fname:={labtalk_path(path, 'file_path')};"):
-        msg = f"Origin could not import the Excel file: {path}"
-        raise ValueError(msg)
+        raise ValueError(f"Origin could not import the Excel file: {path}. The new import workbook may contain partial data.")
     active = o.LTStr("page.name$")
-    requested_name = None
-    if book_name:
-        requested_name = labtalk_name(book_name, "book_name")
+    if not active or active in previous_books or active not in set(workbook_names()):
+        raise RuntimeError("Import finished but the resulting workbook could not be identified safely; inspect the Origin project before retrying.")
+    if requested_name:
         if active != requested_name and execute_labtalk(f"win -r {active} {requested_name};"):
             active = requested_name
     return json.dumps({

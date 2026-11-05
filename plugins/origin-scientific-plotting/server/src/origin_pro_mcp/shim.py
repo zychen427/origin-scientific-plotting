@@ -12,8 +12,8 @@ On a tool call the forwarder:
 * sends a ``request`` frame with a fresh ``request_id`` over a cached connection
   (one per shim process, identified by a per-process ``session_id``);
 * reads the matching ``response`` (correlated by ``request_id``);
-* on a mid-call connection drop, attempts EXACTLY ONE reconnect, then raises a
-  clear, actionable error — never hangs (socket timeouts bound every wait).
+* on a mid-call connection drop, reports an unknown outcome without replaying
+  the request; a later call can reconnect (socket timeouts bound every wait).
 
 A background heartbeat timer pings the daemon every ``heartbeat_interval``
 seconds over the same connection, using the connection's send-lock so it never
@@ -146,6 +146,8 @@ def ensure_daemon(lockfile_path: Optional[str] = None, *,
     """
     if lockfile_path is None:
         lockfile_path = default_lockfile_path()
+    lock_dir = os.path.dirname(os.path.abspath(lockfile_path))
+    os.makedirs(lock_dir, exist_ok=True)
 
     # Global kill-switch: ORIGIN_PRO_MCP_NO_SPAWN lets an operator stop the
     # daemon from the process manager and keep it stopped — no tool call will
@@ -319,19 +321,17 @@ class ShimClient:
 
     def call(self, name: str, kwargs: dict):
         """Forward one tool call; reconnect exactly once on a dropped link."""
-        last_exc = None
-        for _attempt in range(2):
-            conn = self._ensure_conn()
-            try:
-                return self._exchange(conn, name, kwargs)
-            except (OSError, FrameError) as exc:
-                last_exc = exc
-                self._reset_conn()
-        raise RuntimeError(
-            f"Lost the connection to the Origin daemon while calling {name!r} "
-            f"and one reconnect attempt also failed ({last_exc}). The daemon "
-            "may have exited — retry the call to respawn it."
-        )
+        conn = self._ensure_conn()
+        try:
+            return self._exchange(conn, name, kwargs)
+        except (OSError, FrameError) as exc:
+            self._reset_conn()
+            raise RuntimeError(
+                f"Connection lost during {name!r}: its outcome is unknown. "
+                "The request was NOT replayed because it may already have changed "
+                "Origin. Inspect the session before retrying. "
+                f"Transport error: {exc}"
+            ) from exc
 
     def _exchange(self, conn, name: str, kwargs: dict):
         request_id = uuid.uuid4().hex

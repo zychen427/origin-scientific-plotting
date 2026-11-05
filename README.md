@@ -4,9 +4,9 @@
 
 **在 Windows 本机通过自然语言控制 Origin/OriginPro，生成可编辑科研图。**
 
-本项目将 Origin MCP 接口与中文绘图 Skill 打包为 Codex 本地插件，覆盖数据读取、原生绘图、样式调整、图片导出和 `.opju` 项目保存。当前版本为 **0.1.2**。完整插件与独立 Skill 均提供源文件，可按研究项目调整工作流程。
+本项目将 Origin MCP 接口与中文绘图 Skill 打包为 Codex 本地插件，覆盖数据读取、原生绘图、样式调整、图片导出和 `.opju` 项目保存。当前版本为 **0.2.1**。完整插件与独立 Skill 均提供源文件，可按研究项目调整工作流程。
 
-[安装指南](#安装完整插件) · [独立 Skill](#单独使用-skill) · [使用示例](#使用示例) · [验证与演示](#验证与演示) · [常见问题](#常见问题) · [下载插件包](packages/origin-scientific-plotting-0.1.2.zip)
+[安装指南](#安装完整插件) · [独立 Skill](#单独使用-skill) · [使用示例](#使用示例) · [验证与演示](#验证与演示) · [常见问题](#常见问题) · [下载插件包](packages/origin-scientific-plotting-0.2.1.zip)
 
 ## 功能范围
 
@@ -124,7 +124,7 @@ origin-plotting/
 
 **Excel 与误差棒**
 
-> 读取 `D:\data\response.xlsx`的指定工作表。A 列为浓度，B 列为均值，C 列为已计算的标准差 SD。绘制带误差棒的散点图，核对误差列与均值列是否对应，保存原生项目。
+> 读取已准备好的单表 `D:\data\response.xlsx`。A 列为浓度，B 列为均值，C 列为已计算的标准差 SD。绘制带误差棒的散点图，核对误差列与均值列是否对应，保存原生项目。
 
 **修改已有项目**
 
@@ -140,7 +140,7 @@ origin-plotting/
 
 ## 验证与演示
 
-2026-10-08从实际安装目录运行插件，完成以下验证：
+下表记录 2026-10-08 的 0.1.2 本机验证，供了解验证方法；不代表 0.2.1 在所有环境完成同样测试：
 
 | 项目 | 实际结果 |
 | --- | --- |
@@ -190,7 +190,7 @@ python .\scripts\verify_distribution.py
 
 打包脚本同步独立 Skill 与内置 Skill，生成包含隐藏兼容清单的单目录 ZIP，并更新 `SHA256SUMS.json`。校验脚本检查文件哈希、两份 Skill 的一致性、上游源文件哈希与 ZIP 内容。
 
-配置脚本会更改 `mcp.json`中的 Python 路径，因此配置后分发清单可能与原始包不同；重新打包后再校验当前副本。已提交的[插件包](packages/origin-scientific-plotting-0.1.2.zip)保留本次验证机器的配置，另一台电脑应先配置自己的解释器路径再使用。
+配置脚本会更改 `mcp.json`中的 Python 路径，因此配置后分发清单可能与原始包不同；重新打包后再校验当前副本。已提交的[插件包](packages/origin-scientific-plotting-0.2.1.zip)提供可移植的解释器占位配置；使用前先配置自己机器的 Python 解释器。
 
 ## 常见问题
 
@@ -213,6 +213,12 @@ python .\scripts\verify_distribution.py
 
 本仓库自有内容采用[MIT 许可证](LICENSE)。Origin 控制实现来自[youngminsw/Origin-Pro-MCP](https://github.com/youngminsw/Origin-Pro-MCP)，保留其[原始 MIT 声明](plugins/origin-scientific-plotting/server/LICENSE)。来源提交为[`1e9741a`](https://github.com/youngminsw/Origin-Pro-MCP/tree/1e9741af96c45bcac9e619c3ba32264bac6950e7)。
 
-30 个上游源文件与资源的实际 SHA-256 位于[`server/PROVENANCE.json`](plugins/origin-scientific-plotting/server/PROVENANCE.json)。本机依赖元数据的调整和验证边界见[来源说明](docs/PROVENANCE.md)。
+包含本地维护修改的 35 个源码文件与资源的实际 SHA-256 位于[`server/PROVENANCE.json`](plugins/origin-scientific-plotting/server/PROVENANCE.json)。本机依赖元数据的调整和验证边界见[来源说明](docs/PROVENANCE.md)。
 
 如需反馈问题，可提交[GitHub Issue](https://github.com/zychen427/origin-scientific-plotting/issues)，说明 Windows、Origin、Python 和插件版本、操作步骤及实际错误；附图或验证记录前，应去除无关的实验信息和个人路径。
+
+## 0.2.1 更新
+
+本版默认不自动保存现有项目或自动关闭对话框；连接异常或超时不主动关闭 Origin。新建或加载项目需要明确 `replace_current=True`，导出不覆盖已有目标；自定义图例修改源列长名称时须明确授权。写入前校验列，Excel 导入新建独立工作簿，并提供绘图预检、常见图形和稀疏质谱绘图指引。详细限制见插件内 Skill 与工具说明。
+
+启动器默认使用当前用户目录下的独立 daemon 锁文件，避免误连接旧版服务；已存在的后台 daemon 可能仍运行旧代码。保存工作后重新启动相关 MCP 进程，再验证当前版本。

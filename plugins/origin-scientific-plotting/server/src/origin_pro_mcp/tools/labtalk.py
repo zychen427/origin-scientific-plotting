@@ -51,21 +51,8 @@ def run_labtalk(script: str, confirm: bool = False, capture: list[str] | None = 
     The variables' values are read back after the script runs and returned as
     JSON. Use a `$` suffix for string variables (e.g. `capture=["name$"]`).
 
-    Statement-level retry on failure: Origin can fail a whole multi-statement
-    script (e.g. 3+ `layer.*` statements) with "Executed with errors" while
-    applying nothing, and give no indication which statement was the
-    problem. When the whole-script Execute fails and the script has 2+
-    top-level statements, this function automatically retries it
-    statement-by-statement and reports each statement's outcome. Because the
-    retry executes each statement as its own command, it CAN partially apply
-    a script that failed as a whole — this is intentional: it reproduces the
-    field-verified workaround of manually splitting a failing script into
-    2-3 statement chunks, so the statements Origin can run still take
-    effect. A single-statement script that fails is reported as before, with
-    no retry. Caveat: if the whole-script pass DID apply some statements
-    before failing, the retry re-runs them — harmless for idempotent
-    assignments (`layer.x.from=1`), but avoid batching non-idempotent
-    statements (appends, increments) in one script.
+    A failed script may have partially executed. It is not replayed; inspect
+    the current project before deciding whether a retry is safe.
 
     GOTCHA — active window: `layer.*`, `col()`, `%C`, and similar unqualified
     references all target the ACTIVE window, not necessarily the graph/sheet
@@ -111,9 +98,7 @@ def run_labtalk(script: str, confirm: bool = False, capture: list[str] | None = 
         Success/failure message, or an actionable not-executed message when a
         gated token is present and confirm is False. When `capture` is given,
         a JSON object with the executed status and the captured variable
-        values. On a whole-script failure with 2+ top-level statements, a
-        statement-level retry report is appended to the message (or added as
-        "statement_results" in the JSON when `capture` is given).
+        values. On failure, the script may have partially executed and is not replayed.
     """
     if window:
         safe_window = labtalk_name(window, "window")
@@ -127,26 +112,11 @@ def run_labtalk(script: str, confirm: bool = False, capture: list[str] | None = 
             f"Script: {script}"
         )
     success = execute_labtalk(script)
-    statement_results: list[dict] | None = None
-    if not success:
-        statements = split_labtalk_statements(script)
-        if len(statements) >= 2:
-            statement_results = [
-                {
-                    "index": idx,
-                    "status": "OK" if execute_labtalk(stmt) else "FAILED",
-                    "statement": stmt.strip(),
-                }
-                for idx, stmt in enumerate(statements, start=1)
-            ]
     status = "ok" if success else "error"
     if not capture:
         msg = f"Executed {'successfully' if success else 'with errors'}: {script}"
-        if statement_results:
-            report = " / ".join(
-                f"{r['index']} {r['status']} `{r['statement']}`" for r in statement_results
-            )
-            msg += f"\nStatement-level retry: {report}"
+        if not success:
+            msg += "\nThe script may have partially executed; it was not retried. Inspect the project before retrying."
         return msg
     values: dict = {}
     for raw_name in capture:
@@ -156,8 +126,6 @@ def run_labtalk(script: str, confirm: bool = False, capture: list[str] | None = 
         else:
             values[safe_name] = _translate_missing(get_lt_var(safe_name))
     result = {"status": status, "script": script, "values": values}
-    if statement_results:
-        result["statement_results"] = statement_results
     return json.dumps(result)
 
 @mcp.tool()

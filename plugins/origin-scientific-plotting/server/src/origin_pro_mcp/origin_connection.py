@@ -147,16 +147,35 @@ def _reopen_remembered_project(origin) -> None:
         pass
 
 
+def explain_com_error(exc):
+    """Return a diagnostic without assuming access errors mean bad registration."""
+    code = getattr(exc, "hresult", None)
+    if code is not None:
+        code = int(code) & 0xffffffff
+    if code == 0x80070005:
+        return ("Origin COM access denied (0x80070005). Check whether this "
+                "process runs inside a restricted sandbox or under a different "
+                "Windows account/session. Test using the normal MCP host or an "
+                "appropriately permitted desktop process; do not modify COM "
+                "registration solely because access was denied.")
+    if code == 0x80040154:
+        return ("Origin COM class not registered (0x80040154). Check the "
+                "Origin automation registration and the client architecture.")
+    suffix = f" (HRESULT 0x{code:08X})" if code is not None else ""
+    return f"Origin COM connection failed{suffix}: {exc}"
+
+
 def get_origin():
     origin = getattr(_state, "origin", None)
     if origin is not None and not _connection_alive(origin):
-        # Close the stale instance first: if the process is alive-but-wedged,
-        # this stops the relaunch below from orphaning it. (A truly-dead proxy
-        # just no-ops here.)
-        _close_instance(origin)
-        origin = None  # Origin was closed or restarted; reconnect below
-        if hasattr(_state, "origin"):
-            del _state.origin  # keep the factory so a daemon session can relaunch
+        # A COM ping can fail while Origin is busy or showing a dialog. Never
+        # close or replace an instance on an ambiguous liveness failure: it may
+        # contain the user's unsaved work. Let the operator inspect and retry.
+        raise RuntimeError(
+            "The existing Origin connection is not responding. No window was "
+            "closed or replaced. Check Origin for a dialog or busy operation, "
+            "then retry after inspecting the current project."
+        )
     if origin is None:
         factory = getattr(_state, "factory", None)
         if factory is not None:
@@ -182,13 +201,7 @@ def get_origin():
         try:
             origin = win32com.client.Dispatch("Origin.ApplicationSI")
         except pywintypes.com_error as exc:
-            msg = (
-                "Could not connect to Origin via COM (Origin.ApplicationSI). "
-                "Check that Origin/OriginPro is installed and licensed on this "
-                "machine. If it is, run Origin once as administrator to "
-                "re-register its Automation Server."
-            )
-            raise RuntimeError(msg) from exc
+            raise RuntimeError(explain_com_error(exc)) from exc
         try:
             origin.Visible = _MAINWND_SHOW
         except (AttributeError, pywintypes.com_error):

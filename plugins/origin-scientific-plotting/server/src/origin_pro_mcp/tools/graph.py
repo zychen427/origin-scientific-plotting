@@ -1031,6 +1031,10 @@ def _export_via_expgraph(
     path = windows_path(file_path, "file_path")
     if not os.path.splitext(path)[1]:
         path = f"{path}.{safe_format}"
+    elif os.path.splitext(path)[1].lower() != f".{safe_format}":
+        raise ValueError(f"File extension must match export format {safe_format}: {path}")
+    if os.path.exists(path):
+        raise ValueError(f"Export destination already exists: {path}. Choose a new path.")
     out_dir = os.path.dirname(path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
