@@ -1,5 +1,9 @@
 # Publication Figure
 
+## 验证基线
+- 已验证：Origin 2020（上游历史验证；具体工作流见本 skill 内文）；Origin 2026 / Origin64.exe 10.3.0.180：工作表读写、line+symbol 图、出版样式、PNG 导出（2026-11-10）
+- 未验证：其他 Origin 版本；复杂误差棒、全部图形类型、质谱/分组/批量工作流（详见 UPGRADE-STATUS.md）
+
 Create paper-grade figures in Origin Pro with the `origin-pro` MCP server. Treat this skill as a generic starting point: copy it, tune it, and keep your own lab or journal presets close to the projects where you use them.
 
 ## When To Use
@@ -30,18 +34,11 @@ If unspecified, choose a conservative manuscript default: line+symbol for ordere
 
 - Use a restrained scientific style, not decorative styling.
 - Put units in axis labels: `Temperature (K)`, `Current density (mA cm^-2)`.
-- Use the muted pastel palette (`apply_publication_style` default): soft
-  steel blue, muted rose, muted teal, soft amber, soft purple, gray cyan.
-  Avoid pure primary colors — they tire the eyes and dominate the figure.
+- The default categorical palette uses distinguishable blue, vermilion, blue-green, rose, sky blue and gray. Check contrast at final size and retain user-specified or existing colors.
 - Avoid red and green as the only two series colors.
-- `apply_publication_style` defaults are tuned for print: 3.0 pt data
-  lines, size-14 symbols, and 2.5 pt error-bar lines with whisker caps
-  matched to the symbol size.
+- `apply_publication_style` starts with 1.5 pt data lines, size-7 symbols, 1 pt error-bar lines, regular 18 pt axis titles, and 14 pt tick/legend labels. Adjust these to the page and final publication size.
 - Preserve existing axis ranges by default. Set explicit bounds only when appropriate; include error bars and avoid truncating important data. Column charts normally need a meaningful zero baseline. Check ticks for readability.
-- **Keep the project lightweight — delete bad graphs.** When a figure comes
-  out wrong (mis-scaled, wrong plot type, rejected attempt), remove it with
-  the `delete_graph` tool instead of leaving it in the project. A project full
-  of discarded graphs gets heavy and slow.
+- Preserve pre-existing graphs. Clean up only identified temporary graphs created during the current task when their removal is authorized.
 - **The legend must never overlap the data.** `apply_publication_style`,
   `set_legend`, and the fit-curve path auto-place the legend in the
   emptiest corner (the requested `legend_position` is only a preference,
@@ -51,7 +48,7 @@ If unspecified, choose a conservative manuscript default: line+symbol for ordere
   make room.** The tool reports `outside-right` and "moved outside the frame
   to avoid the data" when this happens; no manual step is needed. (A dense
   scatter that fills all four corners is the usual trigger.)
-- Legends: borderless; verify bold styling visually. Explicit legend entries modify source column long names.
+- Legends: borderless; check text readability visually. Explicit legend entries modify source column long names.
 - Use distinct symbols when colors alone may not survive grayscale printing.
 - Keep axis ranges tight but honest; do not crop important outliers.
 - Use legends only when labels cannot be placed directly or series count requires it.
@@ -507,3 +504,10 @@ This file is not meant to be the one true visual style. Make your own version fo
 - Preferred fonts, export folders, panel labels, and annotation conventions
 
 Keep the workflow generic, but let the final taste be yours.
+
+
+## Local lab style (starting point; user and journal take precedence)
+
+Use bold axis titles, SimSun Chinese and Times New Roman Latin by default, a restrained accessible palette, moderate 1.5 pt data lines and smaller markers; avoid unnecessary heavy bolding and excessive frame weight. For Nature submissions apply that specific journal's font and final physical-size rules rather than assuming preview sizes are final. Inspect exported text, legend, data boundaries, and clipped axis titles; do not claim visual QA from a successful export alone. Preserve existing or explicitly requested colors. See Origin plotting skill for the current-session save-first rule.
+
+Default closed frame on all four sides; axis titles bold; Chinese text SimSun and English Times New Roman. Adapt to user-specified exceptions and inspect mixed-font rendering.

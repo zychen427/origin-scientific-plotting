@@ -8,6 +8,12 @@ from .tools import fitting  # noqa: F401
 from .tools import project  # noqa: F401
 from .tools import matrix  # noqa: F401
 from .tools import analysis  # noqa: F401
+from .tools import precise_excel  # noqa: F401
+from .tools import batch_workflows  # noqa: F401
+from .tools import research_workflows  # noqa: F401
+from .tools import spectrum_workflows  # noqa: F401
+from .tools import resumable  # noqa: F401
+from .tools import workflow_templates  # noqa: F401
 
 from .skills import register_skills
 

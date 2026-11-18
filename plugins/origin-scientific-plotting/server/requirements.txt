@@ -1,3 +1,5 @@
 mcp==1.29.1
 pywin32==312; sys_platform == "win32"
 Pillow==12.3.0
+openpyxl==3.1.5
+originpro==1.1.15; sys_platform == "win32"

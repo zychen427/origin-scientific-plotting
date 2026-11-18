@@ -11,7 +11,12 @@ declared length is bounded by :data:`MAX_FRAME` (8 MiB) and rejected before any
 allocation, so a hostile/garbled peer cannot trigger a pre-auth memory DoS.
 Every frame always carries a ``type`` field:
 
-* ``{"type": "hello", "token": <str>, "session_id": <str|None>}``
+* ``{"type": "hello", "token": <str>, "session_id": <str|None>,
+     "code_version": <str|None>, "identity_protocol": <int|None>}``
+  (the identity keys are optional; older clients omit them)
+* ``{"type": "identify"}`` -> ``{"type": "identity", "code_version": <str>,
+     "identity_protocol": <int>, "daemon_pid": <int>, ...}`` (identity probe;
+     older daemons ignore it and the shim falls back to the lockfile hint)
 * ``{"type": "request", "request_id": <str>, "name": <tool>, "kwargs": {...}}``
 * ``{"type": "response", "request_id": <str>, "ok": <bool>,
      "result": <str|None>, "error": <str|None>}``
@@ -76,6 +81,10 @@ class Connection:
         self._sock = sock
         self._send_lock = threading.Lock()
         self.session_id = session_id
+        # Client identity reported in the authenticated hello frame (None for
+        # older clients that do not send one). Filled in by TcpServer.accept.
+        self.client_code_version: Optional[str] = None
+        self.client_identity_protocol: Optional[int] = None
 
     def settimeout(self, timeout: Optional[float]) -> None:
         self._sock.settimeout(timeout)
@@ -175,6 +184,10 @@ class TcpServer:
             return None
         conn.settimeout(None)  # restore blocking mode for the serving phase
         conn.session_id = hello.get("session_id")
+        code_version = hello.get("code_version")
+        conn.client_code_version = code_version if isinstance(code_version, str) else None
+        protocol = hello.get("identity_protocol")
+        conn.client_identity_protocol = protocol if isinstance(protocol, int) else None
         return conn
 
     def close(self) -> None:
@@ -185,9 +198,18 @@ class TcpServer:
 
 
 def connect(host: str, port: int, token: str,
-            session_id: Optional[str] = None) -> Connection:
-    """Open a client connection and perform the hello/token handshake."""
+            session_id: Optional[str] = None,
+            metadata: Optional[dict] = None) -> Connection:
+    """Open a client connection and perform the hello/token handshake.
+
+    ``metadata`` is merged into the hello frame (the daemon ignores unknown
+    keys, so older daemons still accept the connection). The shim uses it to
+    report its code identity alongside the session id.
+    """
     raw = socket.create_connection((host, port))
     conn = Connection(raw, session_id=session_id)
-    conn.send_frame({"type": "hello", "token": token, "session_id": session_id})
+    hello = {"type": "hello", "token": token, "session_id": session_id}
+    if metadata:
+        hello.update(metadata)
+    conn.send_frame(hello)
     return conn

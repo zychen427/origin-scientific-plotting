@@ -1,5 +1,7 @@
 import json
+import math
 from ..app import mcp
+from ..missing import is_origin_missing
 from ..origin_connection import (
     activate_window,
     execute_labtalk,
@@ -198,7 +200,7 @@ def _rows_in_x_range(book: str, sheet: str, x_col: int, x_min, x_max):
     for r, row in enumerate(data, start=1):
         if x_col - 1 < len(row):
             v = row[x_col - 1]
-            if isinstance(v, (int, float)) and abs(v) < 1e100:
+            if isinstance(v, (int, float)) and math.isfinite(v) and not is_origin_missing(v):
                 if (x_min is None or v >= x_min) and (x_max is None or v <= x_max):
                     rows.append(r)
     if not rows:
@@ -226,69 +228,41 @@ def curve_fit(
     peaks: int = 1,
     peak_centers: str = ""
 ) -> str:
-    """Perform curve fitting on worksheet data.
+    """Fit an XY curve, optionally in one X window.
 
     Args:
-        data_book: Source workbook name
-        data_sheet: Source sheet name
-        x_col: X column number (1-based)
-        y_col: Y column number (1-based)
-        function: Fitting function. Built-in options:
-                  line, poly2-5, exp1, exp2, expgrow1, expdecay1,
-                  gauss, lorentz, voigt, power, lognormal, logistic,
-                  boltzmann, hill, sine
-        y_error_col: Y error column (1-based, 0=none)
-        plot_on_graph: Optional name of an existing graph — the fitted
-                       curve is drawn on it as a line (paper style:
-                       data symbols + fit line). Also keeps the fit
-                       report sheets in the workbook.
-        x_min: Optional lower X bound — restrict the fit to rows whose X is
-               >= x_min. Use with x_max to fit a single peak/region and
-               exclude a baseline or a neighboring feature outside the range.
-        x_max: Optional upper X bound — restrict the fit to rows whose X is
-               <= x_max. Either bound may be given alone. The restriction is
-               applied as a contiguous row block (X is assumed monotonic, as
-               spectra are); a "line" fit with a range uses the NLFit engine.
-        peaks: Number of peaks to fit simultaneously (deconvolution). Default 1
-               (single-peak, unchanged). peaks>1 fits N overlapping peaks of the
-               same function at once (XRD/XPS/Raman); ONLY valid for gauss,
-               lorentz and voigt. Composes with x_min/x_max (restrict the range,
-               then deconvolve within it).
-        peak_centers: For peaks>1, optional "x1,x2,..." initial centre guesses,
-               one per peak (count must equal peaks). When empty, Origin's
-               built-in initialisation is used (works well on well-separated
-               peaks; supply centres for tightly overlapping or noisy spectra).
-
-    Returns:
-        JSON with fitted parameters and statistics. Parameter keys are
-        stable across calls for a given function (e.g. "line" always
-        reports "intercept"/"slope", never "A"/"B"). Each parameter has
-        a "value"; "std_error" is also present except for a "line" fit
-        with plot_on_graph="" (the fast fitlr path does not expose fit
-        std errors, only NLFit does). Statistics include r_squared always,
-        plus sum_sq_residuals/reduced_chi_sq/dof for all functions except
-        a "line" fit with plot_on_graph="". Special case: for
-        function="power", the result has NO "parameters" key — Origin
-        2020 cannot read the exponent back over COM, so only a
-        "parameters_note" string is returned instead.
-        For peaks>1 the shape differs: "peaks" (the count), a shared
-        "baseline" {"y0": {...}}, and "parameters" keyed "peak_1".."peak_N",
-        each a block of that function's per-peak parameters (gauss/lorentz:
-        xc/w/A; voigt: xc/A/wG/wL) with value/std_error where readable. When
-        plot_on_graph is given, the cumulative fit envelope is drawn as the fit
-        line and each per-peak component as a thin line.
-    """
+        data_book, data_sheet: source. x_col, y_col: 1-based. y_error_col must be 0; weighted fitting is not verified.
+        function: line, poly2-5, exp1, exp2, expgrow1, expdecay1, gauss,
+            lorentz, voigt, power, lognormal, logistic, boltzmann, hill, sine.
+        plot_on_graph: graph to draw the fit on; keeps reports.
+        x_min, x_max: optional bounds; rows outside are excluded (one
+            contiguous block, X monotonic); "line" with bounds uses NLFit.
+        peaks: fit together (default 1); >1 only gauss/lorentz/voigt.
+        peak_centers: for peaks>1, "x1,x2,..." centres.
+    Returns JSON parameters + statistics; each has "value" and usually
+    "std_error" (missing for a "line" fit with plot_on_graph=""); r_squared
+    always; "power" has only "parameters_note"; peaks>1 gives "peaks",
+    "baseline", peak_1..N."""
     safe_book = labtalk_name(data_book, "data_book")
     safe_sheet = labtalk_name(data_sheet, "data_sheet")
     safe_x_col = positive_column(x_col, "x_col")
     safe_y_col = positive_column(y_col, "y_col")
     safe_function = labtalk_choice(function, FITTING_FUNCTIONS, "function")
 
+    # The old fast fitlr path silently discarded this column; the NLFit
+    # weighting interpretation has not been independently verified either.
+    if y_error_col != 0:
+        positive_column(y_error_col, "y_error_col")
+        raise ValueError("Weighted fitting is not verified; y_error_col cannot be used. Fit with an explicitly validated weighting method in Origin.")
+    for field, value in (("x_min", x_min), ("x_max", x_max)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)):
+            raise ValueError(f"{field} must be a finite number.")
+
     # Multi-peak (deconvolution) validation — fail honestly BEFORE touching
     # Origin. peaks>1 uses the NLFit replica engine, which only makes sense for
     # peak functions.
     _MULTIPEAK_OK = ("gauss", "lorentz", "voigt")
-    if peaks < 1:
+    if isinstance(peaks, bool) or not isinstance(peaks, int) or peaks < 1:
         msg = f"curve_fit peaks ({peaks}) must be >= 1."
         raise ValueError(msg)
     is_multi = peaks > 1
@@ -305,6 +279,8 @@ def curve_fit(
         except ValueError:
             msg = f"curve_fit peak_centers ({peak_centers!r}) must be comma-separated numbers."
             raise ValueError(msg) from None
+        if not all(math.isfinite(c) for c in center_values):
+            raise ValueError("peak_centers must contain only finite numbers.")
         if not is_multi:
             msg = "curve_fit peak_centers only applies when peaks>1."
             raise ValueError(msg)

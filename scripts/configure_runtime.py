@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,7 +22,7 @@ def main():
         raise SystemExit('Python executable not found: ' + str(executable))
     probe = '''import sys,json,importlib.metadata as m
 import mcp.server.fastmcp,win32com.client,PIL
-print(json.dumps({'platform':sys.platform,'python':list(sys.version_info[:3]),'dependencies':{k:m.version(k) for k in ['mcp','pywin32','Pillow']}}))'''
+print(json.dumps({'platform':sys.platform,'python':list(sys.version_info[:3]),'dependencies':{k:m.version(k) for k in ['mcp','pywin32','Pillow','openpyxl','originpro','OriginExt']}}))'''
     result = subprocess.run([str(executable), '-c', probe], text=True, capture_output=True, timeout=30)
     if result.returncode:
         raise SystemExit('Required environment check failed. Install server/requirements.txt in the selected environment.\n' + result.stderr)
@@ -38,7 +38,14 @@ print(json.dumps({'platform':sys.platform,'python':list(sys.version_info[:3]),'d
         backup.mkdir(exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
         shutil.copy2(config, backup / ('mcp.before.' + stamp + '.json'))
-        data['mcpServers']['origin-scientific-plotting']['command'] = str(executable)
+        server = data['mcpServers']['origin-scientific-plotting']
+        server['command'] = str(executable)
+        version = json.loads((config.parent / 'plugin.json').read_text(encoding='utf-8'))['version']
+        local_appdata = os.environ.get('LOCALAPPDATA')
+        if local_appdata:
+            server['env']['ORIGIN_PRO_MCP_LOCKFILE'] = str(
+                Path(local_appdata) / 'origin-scientific-plotting' / version / 'daemon.json'
+            )
         config.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         info['configured'] = str(config)
     print(json.dumps(info, ensure_ascii=False, indent=2))

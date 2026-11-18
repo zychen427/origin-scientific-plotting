@@ -28,7 +28,9 @@ import time
 from typing import Callable, Optional
 
 from . import autosave as _autosave
+from . import runlog
 from .autosave import AutosavePolicy
+from .build_version import CODE_VERSION, IDENTITY_PROTOCOL
 from .origin_connection import (
     clear_session_origin, get_origin, get_remembered_project_path,
     set_session_collision_reader, set_session_context_writer, set_session_origin,
@@ -40,16 +42,36 @@ GetPid = Callable[[object], Optional[int]]
 TerminateProcess = Callable[[int], None]
 ReplyFn = Callable[[dict], None]
 
+# The daemon instance serving this process, if any. Set by Daemon.start and
+# cleared by Daemon.stop; read only by runtime_status() (diagnostics).
+_ACTIVE_DAEMON: Optional["Daemon"] = None
+
+
+def _publish_active_daemon(instance: Optional["Daemon"]) -> None:
+    """Publish the active daemon to the canonical package module as well.
+
+    The daemon normally runs as ``python -m origin_pro_mcp.daemon`` (module
+    ``__main__``), while tool bodies import the canonical
+    ``origin_pro_mcp.daemon`` module. Both objects must see the same instance or
+    ``runtime_status()`` reports "no daemon" from inside the daemon.
+    """
+    global _ACTIVE_DAEMON
+    _ACTIVE_DAEMON = instance
+    canonical = sys.modules.get("origin_pro_mcp.daemon")
+    if canonical is not None and canonical is not sys.modules.get(__name__):
+        canonical._ACTIVE_DAEMON = instance
+
 POOL_MAX_DEFAULT = 3
 DEFAULT_RECONNECT_GRACE: float = 3.0  # seconds; env: ORIGIN_PRO_MCP_RECONNECT_GRACE
 # Per-dispatch hang timeout default (D2). Soft ON at 90s (notify) unless the env
 # var ORIGIN_PRO_MCP_DISPATCH_TIMEOUT is off/0/false/no. Shared with the shim
 # (shim.py imports this) so the client socket budget stays in sync.
-DISPATCH_TIMEOUT_DEFAULT: float = 90.0   # seconds; env: ORIGIN_PRO_MCP_DISPATCH_TIMEOUT
-# Grace AFTER the soft dispatch timeout before a wedged session is force-killed.
-# During this window the client has already been told "Origin looks stuck — go
-# dismiss the dialog"; if the user frees it the call recovers and no kill happens.
-DISPATCH_KILL_GRACE_DEFAULT: float = 90.0  # seconds; env: ORIGIN_PRO_MCP_DISPATCH_KILL_GRACE
+DISPATCH_TIMEOUT_DEFAULT: float = 75.0   # seconds; env: ORIGIN_PRO_MCP_DISPATCH_TIMEOUT
+# Grace AFTER the soft dispatch timeout before a wedged session is reset. During
+# this window the client has already been told "Origin looks stuck — go dismiss
+# the dialog"; if the user frees it the call recovers and no reset happens. The
+# reset never force-kills Origin (an unsaved project may be open there).
+DISPATCH_KILL_GRACE_DEFAULT: float = 75.0  # seconds; env: ORIGIN_PRO_MCP_DISPATCH_KILL_GRACE
 # Proactive periodic autosave interval (seconds) for healthy, agent-isolated
 # sessions. 0 disables. env: ORIGIN_PRO_MCP_AUTOSAVE_INTERVAL
 AUTOSAVE_INTERVAL_DEFAULT: float = 300.0
@@ -63,13 +85,13 @@ def _env_flag_on(name: str) -> bool:
 def _reap_close_enabled() -> bool:
     """Graceful reap CLOSES the Origin only when explicitly opted in. Default
     (unset) = DETACH: keep the user's project window open, just stop the worker."""
-    return _env_flag_on("ORIGIN_PRO_MCP_REAP_CLOSE")
+    return False  # An unattended reap cannot prove a successful save and ownership.
 
 
 def _sweep_orphans_enabled() -> bool:
     """Startup-sweep force-kills leftover Origins only when explicitly opted in.
     Default (unset) = keep them: never auto-destroy a user's project on restart."""
-    return _env_flag_on("ORIGIN_PRO_MCP_SWEEP_ORPHANS")
+    return False  # A recorded PID is not sufficient authority to terminate a process.
 
 
 # --------------------------------------------------------------------------- #
@@ -162,8 +184,12 @@ class Session:
     def __init__(self, session_id: str, origin_factory: OriginFactory,
                  registry: dict, get_pid: Optional[GetPid] = None,
                  autosave_policy: Optional[AutosavePolicy] = None,
-                 dialog_watchdog_factory: Optional[Callable[[int, Callable[[dict], None]], object]] = None):
+                 dialog_watchdog_factory: Optional[Callable[[int, Callable[[dict], None]], object]] = None,
+                 verified_target: Optional[dict] = None):
         self.session_id = session_id
+        self.verified_target = verified_target
+        self._existing_project_saved = verified_target is None
+        self._saved_project_identity = None
         self._factory = origin_factory
         self._registry = registry
         self._get_pid = get_pid or _default_get_pid
@@ -175,6 +201,8 @@ class Session:
         self.instance: object = None
         self.saved_recovery_path: Optional[str] = None
         self.reaping: bool = False  # set once a reap has COMMITTED (stage 1)
+        self.close_owned_on_release = False
+        self._owned_identity = None
         self._start_error: Optional[BaseException] = None
         # S1 runtime modal-dialog handling: the watchdog thread (started once the
         # PID is known) records dialogs here so the dispatch-timeout path can name
@@ -201,7 +229,7 @@ class Session:
     def _com_initialize() -> bool:
         """Initialize this thread's COM apartment (STA). Windows-only, guarded.
 
-        DispatchEx and every later COM call on this worker thread require the
+        Origin automation and every later COM call on this worker thread require the
         thread to have called ``CoInitialize`` first; on a non-main thread
         without it the first COM call raises. No-op (returns False) where
         ``pythoncom`` is unavailable (WSL/tests with a fake factory).
@@ -225,6 +253,7 @@ class Session:
 
     def _run(self) -> None:
         com_inited = self._com_initialize()
+        release_reply = None
         try:
             try:
                 self.instance = self._factory()
@@ -232,18 +261,24 @@ class Session:
                 self._start_error = exc
                 self._ready.set()
                 return
-            # Pass the factory so a dead proxy relaunches THIS session's own
-            # isolated instance, never the shared ApplicationSI (which could
-            # hijack the user's open Origin).
-            set_session_origin(self.instance, self._factory, self.session_id)
+            # Pass a MANAGED factory so a dead proxy relaunches THIS session's
+            # own isolated instance (never the shared ApplicationSI) AND the
+            # relaunched process's pid + dialog watchdog are refreshed.
+            set_session_origin(self.instance, self._managed_factory(),
+                               self.session_id, self.verified_target)
             try:
-                pid = self._get_pid(self.instance)
-                self.pid = int(pid) if pid is not None else None
-            except Exception:
-                # Unknown PID -> None ("do not force-kill"), NEVER os.getpid().
-                self.pid = None
-            self._ready.set()
+                self._refresh_session_pid(self.instance, start_watchdog=False)
+                if self.close_owned_on_release:
+                    from .existing_origin import _process_identity
+                    self._owned_identity = _process_identity(self.pid)
+            except BaseException as exc:
+                self._start_error = exc
+                self._ready.set()
+                return
+            # Start the watchdog BEFORE signalling readiness so a caller that
+            # returns from start() can rely on the pid/watchdog being consistent.
             self._start_dialog_watchdog()
+            self._ready.set()
             try:
                 while True:
                     item = self._queue.get()
@@ -261,15 +296,132 @@ class Session:
                                 on_done()
                         break  # the session is reaped; the worker exits
                     request_id, name, kwargs, reply_fn = item
+                    if name == '__release_origin_session':
+                        try:
+                            modified = bool(self.instance.IsModified)
+                        except Exception as exc:
+                            reply_fn({'type':'response','request_id':request_id,'ok':False,
+                                      'result':None,'error':f'Cannot verify project saved state: {type(exc).__name__}. Save and retry; connection retained.'})
+                            continue
+                        if modified:
+                            reply_fn({'type':'response','request_id':request_id,'ok':False,
+                                      'result':None,'error':'Origin project has unsaved changes. Save it before releasing the connection; nothing was closed.'})
+                            continue
+                        if self.close_owned_on_release:
+                            try:
+                                from .existing_origin import _process_identity, query_peer_pid, require_window
+                                current = _process_identity(self.pid)
+                                if current != self._owned_identity or query_peer_pid(self.instance) != self.pid:
+                                    raise RuntimeError('Origin process identity changed')
+                                window = require_window(self.pid)
+                                if window['creation_filetime'] != self._owned_identity['creation_filetime']:
+                                    raise RuntimeError('Origin window identity changed')
+                                self._owned_hwnd = window['hwnd']
+                                import win32api
+                                self._owned_process_handle = win32api.OpenProcess(0x00100000, False, self.pid)
+                                from .originpro_native import NativeOrigin
+                                self._native_close = isinstance(self.instance, NativeOrigin)
+                                if self._native_close:
+                                    self.instance.api.exit()
+                            except Exception as exc:
+                                reply_fn({'type':'response','request_id':request_id,'ok':False,
+                                          'result':None,'error':f'Cannot confirm safe closure: {type(exc).__name__}: {exc}. The close may have started; inspect the original project and session before retrying.'})
+                                continue
+                        self.reaping = True
+                        release_reply = (request_id, reply_fn)
+                        break
                     reply_fn(self._dispatch(request_id, name, kwargs))
             finally:
                 self._stop_dialog_watchdog()
+                # Drop ALL MCP-owned COM references on the apartment thread.
+                # Do not call Exit/Close or change CanClose (which hides Origin).
                 clear_session_origin()
+                self.instance = None
+                import gc
+                gc.collect()
         finally:
             if com_inited:
                 self._com_uninitialize()
+            if release_reply is not None:
+                request_id, reply_fn = release_reply
+                if self.close_owned_on_release:
+                    try:
+                        import win32api, win32con, win32event, win32gui, win32process
+                        from .existing_origin import _process_identity
+                        handle = self._owned_process_handle
+                        try:
+                            if not self._native_close:
+                                if _process_identity(self.pid) != self._owned_identity:
+                                    raise RuntimeError('Origin process identity changed before close')
+                                if not win32gui.IsWindow(self._owned_hwnd) or win32process.GetWindowThreadProcessId(self._owned_hwnd)[1] != self.pid:
+                                    raise RuntimeError('Origin window no longer matches the owned process')
+                                win32gui.PostMessage(self._owned_hwnd, win32con.WM_CLOSE, 0, 0)
+                            exited = win32event.WaitForSingleObject(handle, 10000) == win32event.WAIT_OBJECT_0
+                        finally:
+                            handle.Close()
+                        if not exited:
+                            raise RuntimeError('Origin did not exit after the normal close request')
+                    except Exception as exc:
+                        reply_fn({'type':'response','request_id':request_id,'ok':False,'result':None,
+                                  'error':f'COM was released but Origin close was not confirmed: {type(exc).__name__}: {exc}. Inspect the original process; do not replay writes.'})
+                        return
+                reply_fn({'type':'response','request_id':request_id,'ok':True,
+                          'result':json.dumps({'released':True,'close_requested':self.close_owned_on_release,
+                                               'origin_exited':self.close_owned_on_release,
+                                               'other_clients_checked':False}), 'error':None})
 
     # -- S1 modal-dialog watchdog ------------------------------------------- #
+
+    def _refresh_session_pid(self, instance, *,
+                             start_watchdog: bool = True) -> None:
+        """Record the (re)launched instance's pid, never a stale one.
+
+        Runs on the session worker thread (COM affinity preserved). An
+        unresolvable pid becomes ``None`` with the reason left to the caller —
+        the old value is never reused. When ``start_watchdog`` is true the old
+        watchdog (bound to the previous process) is stopped first and a fresh one
+        is started for the resolved pid.
+        """
+        try:
+            if instance is None:
+                # No instance exists (failed relaunch): no pid can be known.
+                pid = None
+            else:
+                pid = self._get_pid(instance)
+                pid = int(pid) if pid is not None else None
+        except Exception:
+            # Unknown PID -> None ("do not force-kill"), NEVER os.getpid().
+            pid = None
+        self.pid = pid
+        try:
+            from .origin_connection import set_session_pid
+            set_session_pid(pid)
+        except Exception:
+            pass
+        if start_watchdog:
+            self._stop_dialog_watchdog()
+            self._start_dialog_watchdog()
+
+    def _managed_factory(self) -> OriginFactory:
+        """Wrap the injected factory for the COM relaunch path.
+
+        ``origin_connection.get_origin`` re-runs this callable when a proxy dies;
+        wrapping it is the only place that sees the relaunched process, so pid
+        refresh and dialog-watchdog rebuild belong here.
+        """
+        base = self._factory
+
+        def launch():
+            try:
+                instance = base()
+            except BaseException:
+                # No new process exists: the old pid/watchdog must not linger.
+                self._refresh_session_pid(None, start_watchdog=True)
+                raise
+            self._refresh_session_pid(instance, start_watchdog=True)
+            return instance
+
+        return launch
 
     def _start_dialog_watchdog(self) -> None:
         """Start the persistent per-session dialog watchdog once the PID is known.
@@ -337,8 +489,8 @@ class Session:
         repoint the kept-open window's save target at the recovery file). A
         WEDGED worker is freed instead by the watchdog force-killing its PID.
         """
-        if not _reap_close_enabled():
-            return  # detach: leave the window untouched; the worker exits below
+        if self.verified_target is not None or not _reap_close_enabled():
+            return  # attached user projects are never auto-saved or closed
         project_path = None
         if getter is not None:
             try:
@@ -375,6 +527,18 @@ class Session:
             if fn is None:
                 raise KeyError(f"unknown tool: {name!r}")
             kwargs = kwargs or {}
+            if self.verified_target is not None:
+                from .shim import READ_ONLY_TOOLS
+                from .existing_origin import require_window
+                target = require_window(self.verified_target['pid'])
+                if target['creation_filetime'] != self.verified_target['creation_filetime']:
+                    raise RuntimeError("Origin target has restarted or PID changed; refusing operation.")
+                if name not in READ_ONLY_TOOLS:
+                    current = (self.instance.LTStr('%X') or '', self.instance.LTStr('%G') or '')
+                    if self._saved_project_identity is not None and current != self._saved_project_identity:
+                        raise RuntimeError("The project in the connected Origin window changed since the baseline save; refusing to write.")
+                    if not self._existing_project_saved and name != 'save_project':
+                        raise RuntimeError("Existing Origin project must be saved via save_project before edits; for an unsaved project provide a new .opju path.")
             # Autosave preflight (runs in THIS worker thread, so the snapshot
             # hits this session's own Origin instance). A required-snapshot
             # failure aborts the destructive op instead of risking silent loss.
@@ -382,7 +546,16 @@ class Session:
             if err is not None:
                 return {"type": "response", "request_id": request_id, "ok": False,
                         "result": None, "error": err}
+            if self.verified_target is not None and name == 'save_project':
+                # A subsequent failed save must close the write gate again.
+                self._existing_project_saved = False
             result = fn(**kwargs)
+            if self.verified_target is not None and name == 'save_project':
+                current = (self.instance.LTStr('%X') or '', self.instance.LTStr('%G') or '')
+                if not current[0] or not current[1] or current[1].upper() == 'UNTITLED':
+                    raise RuntimeError("Save returned success, but the project path and name cannot be verified; edits remain blocked.")
+                self._saved_project_identity = current
+                self._existing_project_saved = True
             self._has_work.record_success(name)
             if result is not None and not isinstance(result, str):
                 result = json.dumps(result)
@@ -396,8 +569,12 @@ class Session:
                         "result": None, "error": oversized}
             return response
         except Exception as exc:
+            from .shim import READ_ONLY_TOOLS
+            suffix = ("" if name in READ_ONLY_TOOLS else
+                      " The operation may have partially modified the project; inspect this same session before retrying.")
             return {"type": "response", "request_id": request_id, "ok": False,
-                    "result": None, "error": f"{type(exc).__name__}: {exc}"}
+                    "result": None, "error_type": type(exc).__name__,
+                    "error": f"{type(exc).__name__}: {exc}{suffix}"}
 
     def _autosave_preflight(self, name: str, kwargs: dict) -> Optional[str]:
         """Save the project IN PLACE before a destructive op (so a bad delete is
@@ -405,6 +582,8 @@ class Session:
         string when a REQUIRED save could not be done. No-op when autosave is off
         or there is no work."""
         policy = self._autosave_policy
+        if self.verified_target is not None:
+            return None  # never autosave an attached user session
         if policy is None or not policy.enabled:
             return None
         try:
@@ -535,7 +714,7 @@ class Pool:
             "Close another Origin MCP session and retry."
         )
 
-    def acquire(self, session_id: str, attach: bool = False) -> Session:
+    def acquire(self, session_id: str, attach: bool = False, target_origin: Optional[dict] = None) -> Session:
         # Phase 1 (under lock): reuse a live session, refuse a reaping one, and
         # RESERVE a slot for a new session — but do NOT call Session.start()
         # here (it can block up to ready_timeout; holding the lock would stall
@@ -543,6 +722,8 @@ class Pool:
         with self._lock:
             existing = self._sessions.get(session_id)
             if existing is not None and not existing.reaping:
+                if getattr(existing, '_dead', False):
+                    raise RuntimeError('The worker exited; this session identity cannot be reused. Inspect its Origin instance.')
                 return existing
             if existing is not None:  # a committed reap is in progress
                 self._sessions.pop(session_id, None)
@@ -553,13 +734,28 @@ class Pool:
             if attach and self._attach_session_id not in (None, session_id):
                 raise RuntimeError("Attach requested but another MCP session owns the attach slot; no separate Origin instance was opened.")
             use_attach = bool(attach)
-            factory = self._attach_factory if use_attach else self._factory
+            if use_attach:
+                if not isinstance(target_origin, dict) or set(target_origin) != {'pid', 'creation_filetime'}:
+                    raise RuntimeError('Existing Origin attachment requires an explicitly enumerated PID and creation identity.')
+                target = dict(target_origin)
+                from .existing_origin import connect_verified
+                factory = lambda: connect_verified(target['pid'], target['creation_filetime'])
+            else:
+                target = None
+                factory = self._factory
             get_pid = self._attach_get_pid if use_attach else self._get_pid
-            session = Session(
-                session_id, factory, self._registry, get_pid,
-                autosave_policy=self._autosave_policy,
-                dialog_watchdog_factory=self._dialog_watchdog_factory,
-            )
+            if self._factory is _real_origin_factory:
+                if use_attach:
+                    raise RuntimeError('This server creates owned sessions only; attaching to an existing Origin is disabled.')
+                from .worker_process import ProcessSession
+                session = ProcessSession(session_id)
+            else:
+                session = Session(
+                    session_id, factory, self._registry, get_pid,
+                    autosave_policy=self._autosave_policy,
+                    dialog_watchdog_factory=self._dialog_watchdog_factory,
+                    verified_target=target,
+                )
             if use_attach:
                 self._attach_session_id = session_id
             self._sessions[session_id] = session  # reserve the slot
@@ -569,7 +765,7 @@ class Pool:
             session.start(ready_timeout=self._start_timeout)
         except BaseException:
             with self._lock:
-                if self._sessions.get(session_id) is session:
+                if self._sessions.get(session_id) is session and not hasattr(session, 'worker_pid'):
                     self._sessions.pop(session_id, None)
                 if self._attach_session_id == session_id:
                     self._attach_session_id = None  # rollback frees the attach slot
@@ -799,15 +995,27 @@ class SingletonGuard:
 
 
 def write_lockfile(path: str, port: int, token: str, pid: int,
-                   child_pids: list[int]) -> None:
+                   child_pids: list[int], code_version: Optional[str] = None,
+                   started_at: Optional[float] = None,
+                   protocol: Optional[int] = None) -> None:
     """Atomically write the daemon discovery lockfile (user-only on POSIX).
 
     The token is a credential, so on POSIX the temp file is created 0600 via
     ``os.open`` BEFORE any bytes are written — it is never world-readable at
     any instant — then atomically renamed into place.
+
+    ``code_version``/``started_at``/``protocol`` describe the RUNNING process.
+    They are a discovery hint for older peers; the authenticated ``identify``
+    handshake is the authoritative identity exchange.
     """
     data = {"port": port, "token": token, "pid": pid,
             "child_pids": list(child_pids)}
+    if code_version is not None:
+        data["code_version"] = code_version
+    if started_at is not None:
+        data["started_at"] = started_at
+    if protocol is not None:
+        data["identity_protocol"] = protocol
     tmp = f"{path}.{os.getpid()}.tmp"
     if sys.platform == "win32":
         with open(tmp, "w") as fh:
@@ -876,12 +1084,22 @@ def write_sessions(path: str, data: dict) -> None:
         os.chmod(path, 0o600)
 
 
-# --- Persistent spawned-Origin PID log ------------------------------------- #
-# Every Origin this daemon family launches is recorded here so the NEXT daemon
-# can reclaim any that a crash / spurious relaunch / Exit-that-didn't-take left
-# orphaned — even when the in-memory session table (and thus the lockfile's
-# child_pids) never captured them. PID-authoritative, COM-free.
+# --- Persistent spawned-Origin record -------------------------------------- #
+# Every Origin this daemon family launches is recorded here so later processes
+# can LIST leftovers (the default behaviour never kills them) and so
+# diagnostics can show the evidence. Records are JSONL with a bounded size;
+# legacy PID-only lines remain readable but are flagged as insufficient identity
+# because Windows recycles PIDs.
 _SPAWN_LOG_LOCK = threading.Lock()
+_SPAWN_LOG_MAX_BYTES = 256 * 1024
+_SPAWN_LOG_MAX_ENTRIES = 200
+_SPAWN_GENERATION: Optional[str] = None
+
+
+def set_spawn_generation(generation: Optional[str]) -> None:
+    """Record which daemon generation spawned the next Origin processes."""
+    global _SPAWN_GENERATION
+    _SPAWN_GENERATION = generation
 
 
 def default_spawn_log_path() -> str:
@@ -889,26 +1107,97 @@ def default_spawn_log_path() -> str:
     return os.path.join(os.path.dirname(lf), "spawned-pids.log")
 
 
-def record_spawned_pid(pid: Optional[int], path: Optional[str] = None) -> None:
-    """Append a freshly-spawned Origin PID to the persistent log (best-effort)."""
-    if not pid:
-        return
-    path = path or default_spawn_log_path()
+def _trim_spawn_log_locked(path: str) -> None:
+    """Keep the record bounded (last N lines) — caller holds the lock."""
     try:
-        with _SPAWN_LOG_LOCK:
-            with open(path, "a") as fh:
-                fh.write(f"{int(pid)}\n")
+        if (not os.path.exists(path)
+                or os.path.getsize(path) <= _SPAWN_LOG_MAX_BYTES):
+            return
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            lines = [line for line in handle if line.strip()]
+        keep = lines[-_SPAWN_LOG_MAX_ENTRIES:]
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.writelines(keep)
+        os.replace(tmp, path)
     except OSError:
         pass
 
 
-def read_spawned_pids(path: Optional[str] = None) -> list:
+def record_spawned_pid(pid: Optional[int], path: Optional[str] = None, *,
+                       image: Optional[str] = None,
+                       generation: Optional[str] = None) -> None:
+    """Append one spawned-Origin record (best-effort, bounded, concurrency-safe)."""
+    if not pid:
+        return
     path = path or default_spawn_log_path()
+    note = {
+        "pid": int(pid),
+        "ts": round(time.time(), 3),
+        "generation": (generation if generation is not None
+                       else _SPAWN_GENERATION),
+        "image": image,
+    }
     try:
-        with open(path) as fh:
-            return [int(x) for x in fh.read().split() if x.strip().lstrip("-").isdigit()]
-    except (OSError, ValueError):
-        return []
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        line = json.dumps({key: value for key, value in note.items()
+                           if value is not None}, ensure_ascii=False)
+        with _SPAWN_LOG_LOCK:
+            _trim_spawn_log_locked(path)
+            with open(path, "a", encoding="utf-8", newline="\n") as handle:
+                handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+def read_spawn_records(path: Optional[str] = None) -> list:
+    """Read spawned-Origin records (JSONL plus legacy plain-PID lines).
+
+    Never raises. Each record: ``{pid, ts, generation, image, legacy}``.
+    """
+    path = path or default_spawn_log_path()
+    records: list = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                text = raw.strip()
+                if not text:
+                    continue
+                try:
+                    data = json.loads(text)
+                except ValueError:
+                    data = None
+                if isinstance(data, dict):
+                    try:
+                        pid = int(data.get("pid"))
+                    except (TypeError, ValueError):
+                        continue
+                    records.append({
+                        "pid": pid,
+                        "ts": data.get("ts"),
+                        "generation": data.get("generation"),
+                        "image": data.get("image"),
+                        "legacy": False,
+                    })
+                elif text.lstrip("-").isdigit():
+                    records.append({"pid": int(text), "ts": None,
+                                    "generation": None, "image": None,
+                                    "legacy": True})
+    except OSError:
+        pass
+    return records
+
+
+def read_spawned_pids(path: Optional[str] = None) -> list:
+    """Backward-compatible deduplicated PID list (order preserved)."""
+    seen: set = set()
+    pids: list = []
+    for record in read_spawn_records(path):
+        pid = record["pid"]
+        if pid not in seen:
+            seen.add(pid)
+            pids.append(pid)
+    return pids
 
 
 def clear_spawn_log(path: Optional[str] = None) -> None:
@@ -919,6 +1208,150 @@ def clear_spawn_log(path: Optional[str] = None) -> None:
                 os.remove(path)
     except OSError:
         pass
+
+
+def process_image_name(pid: int) -> Optional[str]:
+    """Executable basename of a live PID (Windows; None elsewhere/failure)."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return None
+        try:
+            buffer = ctypes.create_unicode_buffer(4096)
+            size = wintypes.DWORD(4096)
+            if kernel32.QueryFullProcessImageNameW(
+                    handle, 0, buffer, ctypes.byref(size)):
+                return os.path.basename(buffer.value)
+            return None
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def process_create_time(pid: int) -> Optional[float]:
+    """Process creation time (epoch seconds) of a live PID, or None."""
+    if os.name != "nt":
+        return None
+    try:
+        import win32api
+        import win32process
+
+        handle = win32api.OpenProcess(0x0400, False, int(pid))
+        if not handle:
+            return None
+        try:
+            created = win32process.GetProcessTimes(handle).get("CreationTime")
+            return float(created.timestamp()) if created is not None else None
+        finally:
+            win32api.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def candidate_orphan_origins(*,
+                             spawn_log_path: Optional[str] = None,
+                             live_pids: Optional[set] = None,
+                             current_pids: Optional[list] = None,
+                             generation: Optional[str] = None,
+                             image_resolver=None,
+                             create_time_resolver=None) -> dict:
+    """List recorded Origins that MIGHT be leftovers — never closes anything.
+
+    A record is only a *candidate*: another daemon/lockfile, the user, or an
+    attached Origin may own it. Fields deliberately avoid claiming safety:
+    ``verdict`` is always ``"unverified"`` and ``safe_to_close`` always False.
+    """
+    path = spawn_log_path or default_spawn_log_path()
+    image_resolver = image_resolver or process_image_name
+    create_time_resolver = create_time_resolver or process_create_time
+    try:
+        if live_pids is not None:
+            live = set(live_pids)
+        else:
+            live = set(_origin_process_pids())
+        live_known = True
+    except Exception:
+        live = set()
+        live_known = False
+    current = {int(pid) for pid in (current_pids or []) if pid}
+    gen = generation if generation is not None else _SPAWN_GENERATION
+
+    records = read_spawn_records(path)
+    candidates: list = []
+    for record in records:
+        pid = record["pid"]
+        if pid == os.getpid():
+            continue
+        alive = (pid in live) if live_known else None
+        identity = {
+            "pid": pid,
+            "legacy_pid_only": bool(record.get("legacy")),
+            "recorded_at": record.get("ts"),
+            "recorded_generation": record.get("generation"),
+            "recorded_image": record.get("image"),
+            "current_generation": gen,
+            "image": None,
+            "create_time": None,
+            "alive": alive,
+            "owner_evidence": "unknown",
+            "verdict": "unverified",
+            "safe_to_close": False,
+            "reasons": [],
+        }
+        if record.get("legacy"):
+            identity["reasons"].append(
+                "legacy PID-only record: identity is insufficient (PID reuse)")
+        if alive:
+            try:
+                identity["image"] = image_resolver(pid)
+            except Exception:
+                identity["reasons"].append("image identity unreadable")
+            try:
+                identity["create_time"] = create_time_resolver(pid)
+            except Exception:
+                identity["reasons"].append("process creation time unreadable")
+            if pid in current:
+                identity["owner_evidence"] = "current_daemon_session"
+                identity["reasons"].append(
+                    "owned by the current daemon's live session")
+            elif identity["image"] and not identity["image"].lower().startswith(
+                    ("origin",)):
+                identity["owner_evidence"] = "not_origin_image"
+                identity["reasons"].append(
+                    "live process image does not look like Origin")
+            else:
+                identity["owner_evidence"] = "unverified_owner"
+                identity["reasons"].append(
+                    "alive but no verifiable current owner; another daemon or "
+                    "the user may own it")
+        elif alive is False:
+            identity["owner_evidence"] = "not_running"
+            identity["reasons"].append("recorded process is not running")
+        else:
+            identity["reasons"].append("liveness could not be determined")
+        candidates.append(identity)
+    alive_candidates = [
+        item for item in candidates
+        if item["alive"] and item["owner_evidence"] not in (
+            "current_daemon_session", "not_origin_image")
+    ]
+    return {
+        "spawn_log": path,
+        "records_total": len(records),
+        "candidates": candidates,
+        "orphan_origin_pids": [item["pid"] for item in alive_candidates],
+        "notes": [
+            "Candidates are evidence only: never treat them as safe to close.",
+            "PIDs are recycled; verify image and creation time before any action.",
+        ],
+    }
 
 
 def _ensure_private_dir(directory: str) -> None:
@@ -941,6 +1374,12 @@ def _ensure_private_dir(directory: str) -> None:
 
 
 def default_lockfile_path() -> str:
+    """The unified daemon discovery path used when no explicit/env path is set.
+
+    Keep this the SINGLE default: shim (`resolve_lockfile_path`), the spawned
+    daemon and the launcher must all agree, otherwise two stacks silently
+    believe they share a daemon.
+    """
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
         directory = os.path.join(base, "origin-pro-mcp")
@@ -1124,6 +1563,18 @@ class Daemon:
         self._seen_lock = threading.Lock()
         self._idle_since: Optional[float] = None
         self._lockfile_lock = threading.Lock()
+        # Identity/lifetime of THIS daemon process + lightweight call counters
+        # surfaced by status_snapshot() (diagnostics only; no Origin access).
+        self._started_wall: Optional[float] = None
+        self._started_mono: Optional[float] = None
+        self._call_count = 0
+        self._last_call: dict[str, dict] = {}
+        # Runtime logging / status record (best-effort; never blocks work).
+        self._events = runlog.NullEventLog()
+        self._status_lockfile: Optional[str] = None
+        self._session_cids: dict[str, str] = {}
+        self._logged_sessions: set = set()
+        self._auth_failures = 0
         # -- session ledger (lifecycle continuity) --------------------------- #
         self._sessions_path: Optional[str] = None
         self._generation: Optional[str] = None
@@ -1135,7 +1586,7 @@ class Daemon:
         # Injectable ONE-SHOT liveness helper (set of live Origin PIDs). Reused
         # for mint notices and load-time collision checks; never polled.
         self._live_origin_pids: Callable[[], set] = _origin_process_pids
-        self._monitor_tick = 0.01
+        self._monitor_tick = 0.2
         self._monitor_stop: Optional[threading.Event] = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._stop_lock = threading.Lock()
@@ -1149,6 +1600,55 @@ class Daemon:
     @property
     def watchdog(self) -> Optional[Watchdog]:
         return self._watchdog
+
+    # -- runtime logging (best-effort; never affects tool results) ----------- #
+
+    def configure_logging(self, log_dir: Optional[str]) -> None:
+        """Attach the opt-in structured event log (``ORIGIN_PRO_MCP_LOG_DIR``)."""
+        self._events = runlog.make_event_log(log_dir)
+
+    def _event(self, name: str, level: str = "info", **fields) -> None:
+        try:
+            self._events.event(name, level=level,
+                               code_version=CODE_VERSION, **fields)
+        except Exception:  # pragma: no cover - logging must never break work
+            pass
+
+    def _status(self, event: str, **fields) -> None:
+        if self._status_lockfile is None:
+            return
+        try:
+            runlog.status(self._status_lockfile, event,
+                          code_version=CODE_VERSION, **fields)
+        except Exception:  # pragma: no cover
+            pass
+
+    def _session_cid(self, session_id: Optional[str]) -> Optional[str]:
+        """Short random correlation id for a session (never logs the raw id)."""
+        if not session_id:
+            return None
+        cid = self._session_cids.get(session_id)
+        if cid is None:
+            cid = runlog.correlation_id("sess")
+            if len(self._session_cids) > 512:
+                self._session_cids.clear()
+            self._session_cids[session_id] = cid
+        return cid
+
+    def _log_tool_end(self, name: str, session_id: str, started: float,
+                      response: dict) -> None:
+        try:
+            ok = bool(response.get("ok"))
+            error = None
+            if not ok:
+                raw = str(response.get("error") or "")
+                head = raw.split(":", 1)[0].strip()
+                error = head if head.replace("_", "").isalnum() else "error"
+            self._event("tool_end", tool=name, ok=ok, error_type=error,
+                        duration_ms=round((time.monotonic() - started) * 1000, 1),
+                        session_cid=self._session_cid(session_id))
+        except Exception:  # pragma: no cover
+            pass
 
     def start(self, origin_factory: OriginFactory, registry: Optional[dict] = None,
               max_size: int = POOL_MAX_DEFAULT, host: str = "127.0.0.1",
@@ -1173,7 +1673,7 @@ class Daemon:
               dialog_watchdog_factory: Optional[Callable[[int, Callable[[dict], None]], object]] = None,
               generation: Optional[str] = None,
               live_origin_pids: Optional[Callable[[], set]] = None,
-              monitor_tick: float = 0.01) -> bool:
+              monitor_tick: float = 0.2) -> bool:
         """Acquire the singleton, sweep any orphans left by a crashed prior
         daemon, start the server/pool/watchdog/monitor, write the lockfile, and
         begin accepting connections. Returns ``False`` (and starts nothing) if
@@ -1184,6 +1684,8 @@ class Daemon:
         if lockfile_path is None:
             lockfile_path = default_lockfile_path()
         self._lockfile_path = lockfile_path
+        self._status_lockfile = lockfile_path
+        self._status("starting", pool_max=max_size)
         self._spawn_log_path = os.path.join(
             os.path.dirname(lockfile_path), "spawned-pids.log"
         )
@@ -1197,6 +1699,7 @@ class Daemon:
         # predecessor's recycled PID, which would erase the "previous
         # generation" distinction the continuity notice depends on.
         self._generation = generation or secrets.token_hex(8)
+        set_spawn_generation(self._generation)
         self._live_origin_pids = live_origin_pids or _origin_process_pids
         self._prev_ledger = read_sessions(self._sessions_path)
         self._ledger = {"generation": self._generation,
@@ -1227,6 +1730,7 @@ class Daemon:
         self._guard = SingletonGuard(lockfile_path + ".lock")
         if not self._guard.acquire():
             self._guard = None
+            self._status("start_loser", reason="singleton")
             return False
 
         # Startup sweep: reclaim orphans recorded by a crashed prior daemon
@@ -1246,10 +1750,18 @@ class Daemon:
                                   on_reap=self._on_watchdog_reap,
                                   tick=monitor_tick, clock=self._clock)
         self._watchdog.start()
+        self._started_wall = time.time()
+        self._started_mono = self._clock()
         write_lockfile(lockfile_path, self.port, self.token, os.getpid(),
-                       self._pool.child_pids())
-
+                       self._pool.child_pids(),
+                       code_version=CODE_VERSION,
+                       started_at=self._started_wall,
+                       protocol=IDENTITY_PROTOCOL)
         self._running = True
+        _publish_active_daemon(self)
+        self._status("ready", pool_max=max_size)
+        self._event("daemon_start", pool_max=max_size,
+                    generation=self._generation)
         self._idle_since = self._clock()
         self._accept_thread = threading.Thread(
             target=self._accept_loop, name="daemon-accept", daemon=True
@@ -1272,7 +1784,8 @@ class Daemon:
         # user's project (they detach on graceful reap and survive a daemon
         # kill). Only force-kill leftovers when ORIGIN_PRO_MCP_SWEEP_ORPHANS=1.
         if not _sweep_orphans_enabled():
-            clear_spawn_log(self._spawn_log_path)  # reset the log; keep the procs
+            # Keep the records: they are the only evidence for the read-only
+            # orphan listing and diagnostics. Nothing is killed here either.
             return
         recorded: set = set()
         try:
@@ -1320,6 +1833,10 @@ class Daemon:
         :meth:`_schedule_reap`), not here.
         """
         if not session_id or self._pool is None:
+            return
+        from .worker_process import ProcessSession
+        if isinstance(self._pool.get(session_id), ProcessSession):
+            # Disconnect is not authorization to discard an owned project.
             return
         with self._reap_lock:
             self._reap_pending.pop(session_id, None)
@@ -1380,7 +1897,10 @@ class Daemon:
         try:
             with self._lockfile_lock:
                 write_lockfile(self._lockfile_path, self.port, self.token,
-                               os.getpid(), self._pool.child_pids())
+                               os.getpid(), self._pool.child_pids(),
+                               code_version=CODE_VERSION,
+                               started_at=self._started_wall,
+                               protocol=IDENTITY_PROTOCOL)
         except OSError:
             pass
 
@@ -1710,7 +2230,15 @@ class Daemon:
             except OSError:
                 break  # server socket closed during shutdown
             if conn is None:
-                continue  # bad token / failed handshake
+                # Bad token / failed handshake: count it, rate-limit the log.
+                self._auth_failures += 1
+                if (self._auth_failures <= 10
+                        or self._auth_failures % 100 == 0):
+                    self._event("auth_failed",
+                                auth_failures=self._auth_failures)
+                continue
+            conn.correlation_id = runlog.correlation_id("conn")
+            self._event("connection_open", conn_cid=conn.correlation_id)
             with self._conns_lock:
                 self._conns.append(conn)
             threading.Thread(
@@ -1735,6 +2263,8 @@ class Daemon:
                     break
         finally:
             conn.close()
+            self._event("connection_close",
+                        conn_cid=getattr(conn, "correlation_id", None))
             # Connection-as-liveness: only when the LAST connection for this
             # session closes is a (cancelable) reap scheduled. Suppressed during
             # shutdown (the daemon closed the socket itself).
@@ -1750,17 +2280,69 @@ class Daemon:
             self._mark_live(session_id, conn)  # cancel a pending reap
             self._touch(session_id)            # liveness backstop
             return True
+        if ftype == "ping":
+            # Authenticated liveness probe from a shim. The connection is
+            # already token-authenticated, so a pong proves the cached socket is
+            # still served by this process; it carries no data.
+            self._safe_send(conn, {"type": "pong", "ts": time.time()})
+            return True
+        if ftype == "identify":
+            # Identity probe from a shim. The authenticated connection is the
+            # trust boundary; the reply is diagnostic and never carries the
+            # token. Older daemons ignore this frame (shims fall back to the
+            # lockfile hint and report "unknown").
+            self._safe_send(conn, {
+                "type": "identity",
+                "code_version": CODE_VERSION,
+                "identity_protocol": IDENTITY_PROTOCOL,
+                "daemon_pid": os.getpid(),
+                "generation": self._generation,
+                "started_at": self._started_wall,
+                "pool_max": (self._pool.max_size
+                             if self._pool is not None else None),
+            })
+            return True
         if ftype != "request":
             return True
         request_id = frame.get("request_id")
         name = frame.get("name")
+        with self._seen_lock:
+            self._call_count += 1
+            self._last_call[session_id or ""] = {"name": name, "ts": time.time()}
+        client_version = getattr(conn, "client_code_version", None)
+        if (client_version and client_version != CODE_VERSION
+                and not getattr(conn, "_version_warned", False)):
+            conn._version_warned = True
+            try:
+                print(f"[origin-mcp] client/daemon version mismatch on session "
+                      f"{session_id}: client={client_version} "
+                      f"daemon={CODE_VERSION}", file=sys.stderr)
+            except Exception:
+                pass
         # MEDIUM 1: wrap the WHOLE request path so ANY failure (PoolFull,
         # start/factory/COM error, unknown tool, etc.) returns an actionable
         # response — the shim must never wait out its call_timeout on a hang.
         try:
             self._mark_live(session_id, conn)  # a request implies liveness
             attach_req = bool(frame.get("attach"))
-            session = self._pool.acquire(session_id, attach=attach_req)
+            if name == '__release_origin_session':
+                session = self._pool.get(session_id)
+                if session is None or session.reaping:
+                    raise RuntimeError('No live Origin session to release; no new Origin was launched.')
+            else:
+                if self._pool.get(session_id) is None:
+                    previous = (self._prev_ledger.get('sessions') or {}).get(session_id) or {}
+                    if previous.get('pid') and not previous.get('ended'):
+                        raise RuntimeError('This session belonged to an earlier daemon generation. Its worker identity cannot be reused; inspect the original Origin instance.')
+                session = self._pool.acquire(session_id, attach=attach_req,
+                                             target_origin=frame.get('target_origin'))
+            if session_id and session_id not in self._logged_sessions:
+                if len(self._logged_sessions) > 1000:
+                    self._logged_sessions.clear()
+                self._logged_sessions.add(session_id)
+                self._event("session_mint",
+                            session_cid=self._session_cid(session_id),
+                            pool_used=len(self._pool.session_ids()))
             # First request for this session this generation: compose the
             # one-shot lifecycle notice and record the ledger entry.
             self._maybe_mint_notice(session_id, session, attach_req)
@@ -1790,13 +2372,12 @@ class Daemon:
         (most likely a modal dialog) and to go dismiss it — the session is left
         ALIVE so the call recovers on its own once the user frees Origin.
 
-        Phase 2 (hard, at ``dispatch_timeout + dispatch_kill_grace``): a
-        ``dispatch`` deadline armed with the real PID force-kills Origin as a
-        last resort and :meth:`_on_dispatch_timeout` discards the session.
+        Phase 2 reports the deadline while retaining the session and pending
+        ticket. Neither phase force-kills a process.
 
         The reply disarms both deadlines, so a normal completion (including a
-        recovery after the warning) never kills anything. ``dispatch_kill_grace``
-        of 0 collapses to the legacy single-phase kill at ``dispatch_timeout``.
+        recovery after the warning) never resets anything. ``dispatch_kill_grace``
+        of 0 collapses to a single warning at ``dispatch_timeout``.
         Timeout disabled (0) preserves the original submit path."""
         timeout = self._dispatch_timeout
         # Per-call override: run_labtalk(timeout=N) bounds this one dispatch and
@@ -1807,15 +2388,35 @@ class Daemon:
                     and override > 0):
                 timeout = float(override)
         if not timeout or timeout <= 0 or self._watchdog is None:
-            session.submit(request_id, name, kwargs,
-                           lambda response: self._safe_send(conn, response))
+            started = time.monotonic()
+            self._event("tool_start", tool=name,
+                        session_cid=self._session_cid(session_id))
+
+            def _plain_reply(response, sid=session_id, sname=name, t0=started):
+                self._log_tool_end(sname, sid, t0, response)
+                if sname == '__release_origin_session' and response.get('ok'):
+                    if self._pool is not None:
+                        self._pool.discard(sid, expected=session)
+                    try:
+                        self._ledger_write(sid, {'ended': True})
+                        self._rewrite_lockfile()
+                    except Exception:
+                        pass  # diagnostic bookkeeping must not hide release success
+                self._safe_send(conn, response)
+
+            session.submit(request_id, name, kwargs, _plain_reply)
             return
         grace = self._dispatch_kill_grace if self._dispatch_kill_grace > 0 else 0.0
+        started = time.monotonic()
+        self._event("tool_start", tool=name,
+                    session_cid=self._session_cid(session_id))
         ticket = {"conn": conn, "request_id": request_id, "done": False,
                   "answered": False, "timeout": timeout, "grace": grace}
         with self._dispatch_lock:
             previous = self._dispatch_tickets.get(session_id)
             if previous is not None and not previous.get("done"):
+                self._log_tool_end(name, session_id, started,
+                                   {"ok": False, "error": "Busy:"})
                 self._safe_send(conn, {
                     "type": "response", "request_id": request_id, "ok": False,
                     "result": None,
@@ -1825,6 +2426,7 @@ class Daemon:
             self._dispatch_tickets[session_id] = ticket
 
         def _reply(response, sid=session_id, tk=ticket):
+            self._log_tool_end(name, sid, started, response)
             with self._dispatch_lock:
                 already = tk["answered"]
                 tk["done"] = True
@@ -1836,23 +2438,34 @@ class Daemon:
             if self._watchdog is not None:
                 self._watchdog.disarm(sid, reason="dispatch")
                 self._watchdog.disarm(sid, reason="dispatch-warn")
+            if name == '__release_origin_session' and response.get('ok'):
+                if self._pool is not None:
+                    self._pool.discard(sid, expected=session)
+                try:
+                    self._ledger_write(sid, {'ended': True})
+                    self._rewrite_lockfile()
+                except Exception:
+                    pass  # diagnostic bookkeeping must not hide release success
             if not already:
                 self._safe_send(conn, response)
 
         # Arm BEFORE submit so a fast reply always disarms an already-armed
         # deadline (never a stale one armed after completion). Arm the soft warn
         # FIRST so that if a clock jump makes both deadlines due in one watchdog
-        # tick, the (insertion-ordered) warn is processed before the hard kill.
+        # tick, the (insertion-ordered) warn is processed before the hard reset.
         now = self._clock()
         if grace > 0:
-            # Soft notify: pid=None => the watchdog will NOT kill, only warn.
+            # Phase 1 (soft): pid=None => the watchdog never kills a process; it
+            # only tells the client Origin looks wedged (usually a modal dialog).
             self._watchdog.arm(session_id, None, now + timeout,
                                reason="dispatch-warn", callback=self._on_dispatch_warn)
-        # Do not kill or discard the Origin session on a slow COM call. The
-        # soft warning answers the client; the worker remains bound until done.
-        if grace <= 0:
+            # Phase 2 only reports the timeout; the pending ticket remains.
+            self._watchdog.arm(session_id, None, now + timeout + grace,
+                               reason="dispatch", callback=self._on_dispatch_timeout)
+        else:
+            # Single-phase timeout: report without replacing the session.
             self._watchdog.arm(session_id, None, now + timeout,
-                               reason="dispatch-warn", callback=self._on_dispatch_warn)
+                               reason="dispatch", callback=self._on_dispatch_timeout)
         session.submit(request_id, name, kwargs, _reply)
 
     def _dialog_note(self, session_id: str) -> Optional[str]:
@@ -1903,58 +2516,28 @@ class Daemon:
         })
 
     def _on_dispatch_timeout(self, session_id: str, pid: Optional[int]) -> None:
-        """Hard dispatch-deadline handler (runs on the watchdog thread; the Origin
-        PID was already force-killed before this call). Discard the wedged session
-        so a reconnect mints a fresh one, and reply the client ONLY if the soft
-        notify has not already answered it."""
-        # Capture the dialog diagnosis BEFORE discarding the session (discard
-        # removes it from the pool, after which the watchdog history is gone).
-        note = self._dialog_note(session_id)
+        """Report a deadline while retaining the original session and ticket.
+
+        The call may still be running. Its ticket blocks further dispatch until
+        the worker returns, after which the same session can be inspected.
+        """
+        note = self._dialog_note(session_id) or ""
         with self._dispatch_lock:
-            ticket = self._dispatch_tickets.pop(session_id, None)
-            if ticket is None:
+            ticket = self._dispatch_tickets.get(session_id)
+            if ticket is None or ticket["answered"]:
                 return
-            answered = ticket["answered"]
-            ticket["done"] = True
             ticket["answered"] = True
             conn = ticket["conn"]
             request_id = ticket["request_id"]
             budget = ticket.get("timeout", self._dispatch_timeout)
-        # Discard the wedged session so its slot frees and a fresh one is minted.
-        if self._pool is not None:
-            existing = self._pool.get(session_id)
-            if existing is not None:
-                existing.reaping = True
-                # The PID is already dead, so the wedged COM call unblocks and
-                # the worker returns to its queue: _STOP (via force_close, which
-                # never joins) lets it exit through _run's finally — stopping the
-                # session's DialogWatchdog instead of leaking it as a forever
-                # EnumWindows poller against a dead PID.
-                existing.force_close()
-            self._pool.discard(session_id, expected=existing)
-        with self._seen_lock:
-            self._last_seen.pop(session_id, None)
-        self._last_snapshot.pop(session_id, None)
-        self._lockfile_sessions.discard(session_id)
-        # The Origin PID was force-killed: flag the entry ended and clear one-shot
-        # state so a reconnect mints (and re-notifies) cleanly.
-        self._ledger_write(session_id, {"ended": True})
-        with self._ledger_lock:
-            self._minted.discard(session_id)
-            self._pending_notices.pop(session_id, None)
-        self._rewrite_lockfile()
-        if answered:
-            return  # the soft notify already replied; don't send a second frame
-        killed = " and its Origin was terminated" if pid is not None else (
-            " but its Origin PID was unknown, so the wedged instance may persist "
-            "until the next daemon restart")
-        cause = f" {note}" if note is not None else ""
         self._safe_send(conn, {
             "type": "response", "request_id": request_id, "ok": False,
             "result": None,
-            "error": (f"Origin operation exceeded the {budget:.0f}s "
-                      f"dispatch timeout and was force-reset{killed}.{cause} Retry; "
-                      "unsaved changes in that session may be lost."),
+            "error": (f"Origin operation exceeded the {budget:.0f}s dispatch "
+                      f"budget; its result is unknown.{note} The session is "
+                      "retained and further operations are blocked while this "
+                      "call runs. Inspect the same project after it returns; "
+                      "do not automatically replay a write."),
         })
 
     def _safe_send(self, conn: Connection, frame: dict) -> None:
@@ -1979,6 +2562,8 @@ class Daemon:
                 return
             self._stopped = True
         self._running = False
+        self._event("daemon_stop")
+        self._status("stopping")
         # Unregister the ledger seams so a stopped daemon never services a
         # worker-thread project change / collision check (the next daemon
         # re-registers its own in start()).
@@ -2012,7 +2597,46 @@ class Daemon:
         if self._guard is not None:
             self._guard.release()
             self._guard = None
+        _publish_active_daemon(None)
         self._stopped_event.set()
+
+    def status_snapshot(self) -> dict:
+        """Read-only runtime status for diagnostics (no COM, no side effects)."""
+        now = self._clock()
+        pool = self._pool
+        sessions = pool.session_ids() if pool is not None else []
+        with self._dispatch_lock:
+            inflight = sorted(self._dispatch_tickets.keys())
+        clients: dict = {}
+        with self._conns_lock:
+            for sid, conns in self._conns_by_session.items():
+                clients[sid] = sorted({
+                    str(getattr(conn, "client_code_version", None) or "unknown")
+                    for conn in conns
+                })
+        with self._seen_lock:
+            last_calls = dict(self._last_call)
+        return {
+            "active": bool(self._running),
+            "daemon_pid": os.getpid(),
+            "code_version": CODE_VERSION,
+            "identity_protocol": IDENTITY_PROTOCOL,
+            "generation": self._generation,
+            "started_at": self._started_wall,
+            "uptime_sec": (round(now - self._started_mono, 1)
+                           if self._started_mono is not None else None),
+            "lockfile": self._lockfile_path,
+            "pool": {
+                "max": pool.max_size if pool is not None else None,
+                "session_ids": list(sessions),
+                "origin_pids": (pool.child_pids()
+                                if pool is not None else []),
+                "inflight_sessions": inflight,
+            },
+            "connected_clients": clients,
+            "calls_total": self._call_count,
+            "last_call": last_calls,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -2073,9 +2697,9 @@ class _InPackageFakeOrigin:
 
 # Origin's COM Application object exposes no usable window handle on the tested
 # build (Origin 2020: ``instance.Hwnd`` does not exist), so the spawned process
-# id is captured by diffing the ``Origin64.exe`` process list around the
-# ``DispatchEx`` launch. The launch + snapshot is serialized by ``_LAUNCH_LOCK``
-# so two concurrent session launches can't mis-attribute each other's new PID,
+# id is read inside Origin and checked against the process-list snapshot around
+# ``DispatchEx(Origin.Application)``. The launch + snapshot is serialized by
+# ``_LAUNCH_LOCK`` so concurrent launches cannot adopt an existing server,
 # and the captured PID is stashed on a thread-local that ``_real_origin_get_pid``
 # reads back on the SAME worker thread (factory + get_pid run sequentially there).
 # Candidate Origin executable image names, across versions/bitness. Override
@@ -2335,14 +2959,16 @@ def _make_dialog_watchdog(pid, on_event) -> DialogWatchdog:
 def _real_origin_factory():
     """Default factory: a fresh, isolated ``Origin.exe`` per session (Windows).
 
-    Uses ``DispatchEx`` (out-of-process) so each session gets its own process —
-    model B1. Captures the spawned ``Origin64.exe`` PID by snapshot-diff (under
+    Uses ``DispatchEx('Origin.Application')`` so each session gets its own
+    automation server and the COM interfaces used by the MCP tools. Captures the spawned
+    ``Origin64.exe`` PID by snapshot-diff (under
     ``_LAUNCH_LOCK`` to keep attribution race-free) and stashes it for
     ``_real_origin_get_pid``. On non-Windows this raises when invoked.
     """
-    import win32com.client  # Windows-only; imported lazily on the worker thread
+    import win32com.client
 
     pid: Optional[int] = None
+    _real_pid_tls.pid = None
     with _LAUNCH_LOCK:
         before = _origin_process_pids()
         try:
@@ -2350,17 +2976,28 @@ def _real_origin_factory():
         except Exception as exc:
             from .origin_connection import explain_com_error
             raise RuntimeError(explain_com_error(exc)) from exc
-        # DispatchEx returns once the server is connectable, but the process may
+        # The automation constructor can return before the process appears, so
         # take a moment to appear in the task list — poll briefly.
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             new = _origin_process_pids() - before
             if new:
-                pid = sorted(new)[0]
                 break
             time.sleep(0.2)
-    # Show (or hide, per ORIGIN_PRO_MCP_VISIBLE) the instance's window —
-    # DispatchEx instances start hidden, unlike the old ApplicationSI path.
+        # A process-list delta alone cannot prove which server this proxy
+        # controls. Read the PID inside Origin and require a newly launched
+        # server, even when another user/agent Origin is already open.
+        from .existing_origin import query_peer_pid, _process_identity
+        pid = query_peer_pid(instance)
+        if pid in before or pid not in _origin_process_pids():
+            raise RuntimeError(
+                f"Isolated Origin launch did not produce a new verified server "
+                f"(COM peer PID {pid}). No project command was sent."
+            )
+        identity = _process_identity(pid)
+        if os.path.basename(identity['image']).lower() not in ('origin.exe', 'origin64.exe'):
+            raise RuntimeError("The isolated COM peer is not an Origin executable; refusing connection.")
+    # Show (or hide, per ORIGIN_PRO_MCP_VISIBLE) the instance's window.
     # Best-effort: a headless/odd build may reject it.
     try:
         instance.Visible = _origin_visible()
@@ -2394,7 +3031,7 @@ def resolve_origin_factory() -> OriginFactory:
     * ``ORIGIN_PRO_MCP_ORIGIN_FACTORY`` — a dotted path to a zero-arg callable
       (escape hatch for tests / custom integrations), takes precedence.
     * ``ORIGIN_PRO_MCP_FAKE_ORIGIN=1`` — the in-package fake (WSL test seam).
-    * otherwise — the real ``DispatchEx`` factory.
+    * otherwise — the real COM factory.
     """
     dotted = os.environ.get("ORIGIN_PRO_MCP_ORIGIN_FACTORY")
     if dotted:
@@ -2411,7 +3048,7 @@ def resolve_origin_factory() -> OriginFactory:
 def resolve_get_pid(factory: OriginFactory) -> Optional[GetPid]:
     """Pick the child-PID resolver for ``factory``.
 
-    Only the real ``DispatchEx`` factory spawns a separate ``Origin.exe`` whose
+    Only the real COM factory spawns a separate ``Origin.exe`` whose
     PID we can resolve (and force-kill). For any other factory (fakes / custom
     integrations) return ``None`` so the pool falls back to the safe default
     (``_default_get_pid`` -> ``None`` -> "do not force-kill").
@@ -2426,7 +3063,7 @@ def _attach_origin_factory():
     single-instance automation server (``Origin.ApplicationSI``) — verified to
     attach to a running instance; if none exists Origin can launch a new one.
     On non-Windows this raises when invoked."""
-    import win32com.client  # Windows-only; imported lazily on the worker thread
+    import win32com.client
 
     try:
         inst = win32com.client.Dispatch("Origin.ApplicationSI")
@@ -2452,7 +3089,7 @@ def resolve_attach_factory() -> Optional[OriginFactory]:
     """The attach-mode factory, or None to disable attach mode.
 
     ``ORIGIN_PRO_MCP_ATTACH_FACTORY`` (dotted path) overrides for tests; when the
-    real DispatchEx factory is in use, attach maps to ``Origin.ApplicationSI``.
+    real COM factory is in use, attach maps to ``Origin.ApplicationSI``.
     Fakes/custom factories get no attach factory (attach requests fall back to
     the normal isolated factory)."""
     dotted = os.environ.get("ORIGIN_PRO_MCP_ATTACH_FACTORY")
@@ -2466,6 +3103,27 @@ def resolve_attach_factory() -> Optional[OriginFactory]:
     return None
 
 
+def runtime_status() -> dict:
+    """Read-only status of the daemon serving THIS process, if any.
+
+    Tool bodies execute inside the daemon process, so this answers "which daemon
+    am I running in" without any network call or COM access. Safe when no daemon
+    is active (returns ``active: False`` with a reason).
+    """
+    daemon = _ACTIVE_DAEMON
+    if daemon is None:
+        return {"active": False, "code_version": CODE_VERSION,
+                "identity_protocol": IDENTITY_PROTOCOL,
+                "reason": "No daemon instance in this process "
+                          "(in-process server mode?)"}
+    try:
+        return daemon.status_snapshot()
+    except Exception as exc:  # pragma: no cover - diagnostics must never raise
+        return {"active": False, "code_version": CODE_VERSION,
+                "identity_protocol": IDENTITY_PROTOCOL,
+                "reason": f"{type(exc).__name__}: {exc}"}
+
+
 def main(argv: Optional[list] = None) -> int:
     """Daemon entry point (``python -m origin_pro_mcp.daemon``).
 
@@ -2474,10 +3132,21 @@ def main(argv: Optional[list] = None) -> int:
     status 0 so the shim's auto-spawn race resolves cleanly. The lockfile path
     may be overridden via ``ORIGIN_PRO_MCP_LOCKFILE`` (used by the shim).
     """
+    # ``python -m`` executes this file as __main__. Alias it under its canonical
+    # name so tool bodies that later ``import origin_pro_mcp.daemon`` (e.g. the
+    # diagnostics path) share THIS module object and can see the active daemon
+    # published by Daemon.start.
+    if __name__ == "__main__":
+        sys.modules.setdefault("origin_pro_mcp.daemon", sys.modules[__name__])
     lockfile_path = os.environ.get("ORIGIN_PRO_MCP_LOCKFILE") or None
+    effective_lockfile = lockfile_path or default_lockfile_path()
+    runlog.status(effective_lockfile, "entry")
+    if os.environ.get("ORIGIN_PRO_MCP_FAULTHANDLER") == "1":
+        # Explicit opt-in: a fatal traceback contains absolute source paths.
+        runlog.enable_fault_handler(effective_lockfile)
     _grace_env = os.environ.get("ORIGIN_PRO_MCP_RECONNECT_GRACE")
     reconnect_grace = float(_grace_env) if _grace_env is not None else DEFAULT_RECONNECT_GRACE
-    # A cold Origin launch via DispatchEx takes ~8-15s (longer on first launch /
+    # A cold Origin launch via COM takes ~8-15s (longer on first launch /
     # slow disks), so the production session start timeout must be generous —
     # well above the test default of 10s. Overridable via env.
     _start_env = os.environ.get("ORIGIN_PRO_MCP_START_TIMEOUT")
@@ -2544,23 +3213,31 @@ def main(argv: Optional[list] = None) -> int:
     # the request frame's `attach` flag (ORIGIN_PRO_MCP_ATTACH on the shim side).
     attach_factory = resolve_attach_factory()
     # S1: wire the persistent per-session modal-dialog watchdog only for the real
-    # DispatchEx factory (it needs Win32 + a real spawned Origin PID). Fakes/tests
+    # COM factory (it needs Win32 + a real spawned Origin PID). Fakes/tests
     # inject their own factory via the constructor chain.
     dialog_watchdog_factory = (
         _make_dialog_watchdog if factory is _real_origin_factory else None
     )
     daemon = Daemon()
-    if not daemon.start(origin_factory=factory, get_pid=get_pid,
-                        lockfile_path=lockfile_path,
-                        reconnect_grace=reconnect_grace,
-                        start_timeout=start_timeout,
-                        dispatch_timeout=dispatch_timeout,
-                        dispatch_kill_grace=dispatch_kill_grace,
-                        autosave_interval=autosave_interval,
-                        autosave_policy=autosave_policy,
-                        attach_factory=attach_factory,
-                        attach_get_pid=_attach_get_pid,
-                        dialog_watchdog_factory=dialog_watchdog_factory):
+    daemon.configure_logging(os.environ.get("ORIGIN_PRO_MCP_LOG_DIR"))
+    try:
+        started = daemon.start(origin_factory=factory, get_pid=get_pid,
+                               lockfile_path=lockfile_path,
+                               reconnect_grace=reconnect_grace,
+                               start_timeout=start_timeout,
+                               dispatch_timeout=dispatch_timeout,
+                               dispatch_kill_grace=dispatch_kill_grace,
+                               autosave_interval=autosave_interval,
+                               autosave_policy=autosave_policy,
+                               attach_factory=attach_factory,
+                               attach_get_pid=_attach_get_pid,
+                               dialog_watchdog_factory=dialog_watchdog_factory)
+    except Exception as exc:
+        runlog.status(effective_lockfile, "init_error",
+                      error_type=runlog.error_type(exc))
+        raise
+    if not started:
+        runlog.status(effective_lockfile, "exit", reason="singleton_loser")
         return 0  # another daemon owns the singleton; the loser exits cleanly
 
     stop = threading.Event()
@@ -2583,6 +3260,7 @@ def main(argv: Optional[list] = None) -> int:
         pass
     finally:
         daemon.stop()
+        runlog.status(effective_lockfile, "exit", reason="stopped")
     return 0
 
 

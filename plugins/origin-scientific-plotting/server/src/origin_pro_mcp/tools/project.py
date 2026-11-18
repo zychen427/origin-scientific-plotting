@@ -7,6 +7,7 @@ from ..origin_connection import (
     activate_window,
     check_project_collision,
     execute_labtalk,
+    forget_created_graphs,
     get_origin,
     graph_names,
     remember_project_path,
@@ -48,6 +49,7 @@ def new_project(replace_current: bool = False) -> str:
     if not replace_current:
         raise ValueError("Replacing the current project may discard unsaved work; save it and pass replace_current=True to continue.")
     o = get_origin()
+    forget_created_graphs()
     o.NewProject()
     remember_project_path(None)  # a fresh project has no on-disk path to recover
     return "New project created"
@@ -88,11 +90,19 @@ def save_project(file_path: str = "") -> str:
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
         bak = _backup_existing(path)  # safety net before overwriting
-        if not o.Save(path):
+        from ..originpro_backend import is_available as _originpro_available
+        if _originpro_available():
+            from ..originpro_backend import save_project as _originpro_save_project
+            saved = _originpro_save_project(path)
+        else:
+            saved = o.Save(path)
+        if not saved:
             msg = f"Origin could not save the project to {path}."
             if bak:
                 msg += f" A pre-save backup was kept at {bak}."
             raise ValueError(msg)
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            raise ValueError(f"Origin reported a save but no nonempty file was found at {path}; inspect the project before retrying.")
         remember_project_path(path)
         return f"Project saved to: {path}" + (f" (backup: {bak})" if bak else "")
     # No path -> save to the project's current location.
@@ -103,7 +113,13 @@ def save_project(file_path: str = "") -> str:
             "file_path if you really mean to save an empty project elsewhere."
         )
         raise ValueError(msg)
-    if not o.Save(""):
+    from ..originpro_backend import is_available as _originpro_available
+    if _originpro_available():
+        from ..originpro_backend import save_project as _originpro_save_project
+        saved = _originpro_save_project("")
+    else:
+        saved = o.Save("")
+    if not saved:
         msg = (
             "Origin could not save: the project has no file location yet. "
             "Pass file_path to save it somewhere."
@@ -131,6 +147,7 @@ def load_project(file_path: str, replace_current: bool = False) -> str:
     if not replace_current:
         raise ValueError("Loading replaces the current project and may discard unsaved work; save it and pass replace_current=True to continue.")
     o = get_origin()
+    forget_created_graphs()
     if not o.Load(path):
         msg = f"Origin could not open the project file: {path}"
         raise ValueError(msg)
@@ -165,22 +182,14 @@ def export_all_graphs(
     format: str = "png",
     width: int = 0,
 ) -> str:
-    """Export every graph in the project to image files (one per graph).
-
-    Uses the same clipboard-free export as export_graph (Origin's expGraph
-    X-Function), so the user's clipboard is preserved.
+    """Export every graph to its own image file; never touches the clipboard.
 
     Args:
-        output_dir: Output directory (Windows or WSL style). Created if missing.
-        format: Output format. Raster: png, jpg, tif, bmp. Vector: pdf, eps, emf
-        width: Output raster pixel WIDTH. 0 (default) = auto ~1200px wide. Any
-            value > 0 is applied to every exported graph (height follows each
-            graph's aspect ratio; Origin's expGraph cannot set an independent
-            height). Ignored for vector formats (resolution-independent).
-
-    Returns:
-        Per-graph list of exported files
-    """
+        output_dir: output dir (Windows or WSL style); created if missing.
+        format: png, jpg, tif, bmp (raster) or pdf, eps, emf (vector).
+        width: raster pixel WIDTH; 0 (default) = auto ~1200, else applied to
+            every graph (height follows each aspect); ignored for vector.
+    Returns the exported file paths."""
     from .graph import _export_via_expgraph
 
     safe_format = labtalk_choice(format.lower(), EXPORT_FORMATS, "format")
@@ -203,13 +212,15 @@ def export_all_graphs(
             else:
                 exported.append(export_graph_to_file(name, path, format=safe_format))
         except (ValueError, RuntimeError) as exc:
-            failed.append(f"{name}: {exc}")
+            failed.append(f"{name}: {type(exc).__name__}: {exc}")
+            break
 
     lines = [f"Exported {len(exported)} of {len(names)} graphs to {out_dir}:"]
     lines.extend(f"  {p}" for p in exported)
     if failed:
         lines.append("Failed:")
         lines.extend(f"  {f}" for f in failed)
+        lines.append('Stopped after failure; inspect any partial output before retrying.')
     return "\n".join(lines)
 
 

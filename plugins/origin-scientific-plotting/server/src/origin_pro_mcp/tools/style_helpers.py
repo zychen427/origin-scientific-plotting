@@ -1,11 +1,12 @@
 from ..labtalk_safe import labtalk_choice, labtalk_name
 from ..origin_connection import (
-    activate_window, execute_labtalk, get_lt_var, get_origin, graph_names,
-    sheet_names,
+    activate_window, execute_labtalk, get_lt_str, get_lt_var, get_origin,
+    graph_names, is_session_created_graph, sheet_names,
 )
 
 # COM Column.Type designation codes (Origin 2020 type library)
 _COM_COLTYPE_Y_ERROR = 2
+_COM_COLTYPE_X_ERROR = 6
 _COM_COLTYPE_X = 3
 
 
@@ -20,7 +21,12 @@ def _find_layer_com(o, safe_graph_name: str):
     project file. Returns the layer or None. The second path is LIVE-UNVERIFIED
     (defensive backstop for loaded pages that don't resolve through
     ``FindGraphLayer``)."""
-    gl = o.FindGraphLayer(f"[{safe_graph_name}]Layer1")
+    try:
+        gl = o.FindGraphLayer(f"[{safe_graph_name}]Layer1")
+    except Exception:
+        # Use the same session proxy for every lookup. Replacing it through
+        # ApplicationSI could select another open Origin instance.
+        gl = None
     if gl is not None:
         return gl
     try:
@@ -94,8 +100,52 @@ def get_plot_names(graph_name: str) -> list:
     without activating is exactly what returned an empty (frozen) plot list and
     made per-curve edits silently no-op.
     """
-    gl = acquire_graph_layer(graph_name)
-    return _plot_names_from_layer(gl)
+    com_error = None
+    names = []
+    try:
+        gl = acquire_graph_layer(graph_name)
+        names = _plot_names_from_layer(gl)
+    except Exception as exc:
+        com_error = exc
+    if names:
+        return names
+    # For a graph created by this session, LabTalk's documented `layer -c`
+    # count and `%Z` register provide a read-only fallback. Do not apply it to
+    # arbitrary graphs in loaded projects or attached user sessions.
+    if is_session_created_graph(graph_name):
+        try:
+            return _plot_names_labtalk(graph_name)
+        except Exception as exc:
+            if com_error is not None:
+                raise RuntimeError(
+                    f"Could not enumerate plots on '{graph_name}' through "
+                    f"COM ({type(com_error).__name__}: {com_error}) or "
+                    f"LabTalk ({type(exc).__name__}: {exc})."
+                ) from exc
+            raise
+    if com_error is not None:
+        raise com_error
+    return names
+
+
+def _plot_names_labtalk(graph_name: str) -> list[str]:
+    """Read a session-created active graph's data-plot names via LabTalk."""
+    import re
+
+    activate_window(graph_name, "graph_name")
+    ok = execute_labtalk(
+        "layer -c; _opm_plot_count = count; _opm_plot_names$ = %Z;"
+    )
+    if not ok:
+        raise RuntimeError("Origin rejected LabTalk `layer -c` on the active graph.")
+    count = int(get_lt_var("_opm_plot_count"))
+    raw = get_lt_str("_opm_plot_names$") or ""
+    names = re.findall(r"\(([^()]*)\)", raw)
+    if count != len(names):
+        raise RuntimeError(
+            f"LabTalk reported {count} plot(s) but returned {len(names)} names: {raw!r}."
+        )
+    return names
 
 
 def _com_book_sheet_names(o, book: str) -> list:
@@ -173,7 +223,7 @@ def find_plot_column(plot_name: str):
     return found[3] if found is not None else None
 
 
-def settle_new_plots(graph_name: str, expected_min_plots: int, timeout_s: float = 4.0) -> None:
+def settle_new_plots(graph_name: str, expected_min_plots: int, timeout_s: float = 15.0) -> None:
     """Settle barrier for a freshly-plotted graph page.
 
     A graph page immediately after ``CreatePage``/``plotxy``/
@@ -190,27 +240,47 @@ def settle_new_plots(graph_name: str, expected_min_plots: int, timeout_s: float 
     """
     import time
 
+    if expected_min_plots < 0:
+        raise ValueError("expected_min_plots must be non-negative.")
     start = time.monotonic()
     first = True
+    last_error = None
+    last_count = 0
     while True:
         try:
-            infos = get_plot_info(graph_name)
-        except Exception:
-            # Graph not resolvable at all — not a timing issue, so polling
-            # longer won't help (this is what a freshly CreatePage'd page
-            # unknown to a test double hits; a real graph always resolves).
-            return
-        if len(infos) >= expected_min_plots:
+            # A newly launched instance can take longer than a few
+            # seconds to expose its just-created DataPlots collection through
+            # COM. Use non-strict classification here: settling only needs to
+            # know that plot objects exist; their source/error roles are
+            # validated by the subsequent editing operation.
+            infos = get_plot_info(graph_name, strict=False)
+            last_count = len(infos)
+            last_error = None
+        except Exception as exc:
+            # A newly created graph may not be resolvable until Origin finishes
+            # processing its plot command. Keep retrying within the same
+            # bounded deadline, but never report a false successful settle.
+            infos = []
+            last_count = 0
+            last_error = f"{type(exc).__name__}: {exc}"
+        if last_count >= expected_min_plots:
             if not first:
                 time.sleep(0.3)
             return
         first = False
         if time.monotonic() - start >= timeout_s:
-            return
+            detail = (
+                f"Timed out after {timeout_s:.1f}s waiting for at least "
+                f"{expected_min_plots} editable plot(s) on '{graph_name}'; "
+                f"Origin exposed {last_count}."
+            )
+            if last_error:
+                detail += f" Last layer-read error: {last_error}."
+            raise RuntimeError(detail)
         time.sleep(0.1)
 
 
-def get_plot_info(graph_name: str) -> list:
+def get_plot_info(graph_name: str, *, strict: bool = True) -> list:
     """[{"name", "is_error"}] for each plot in Layer1, in plot order.
 
     Error-bar plots appear in DataPlots like normal plots; they are
@@ -219,9 +289,15 @@ def get_plot_info(graph_name: str) -> list:
     """
     infos = []
     for pname in get_plot_names(graph_name):
-        col = find_plot_column(pname)
-        is_error = col is not None and col.Type == _COM_COLTYPE_Y_ERROR
+        try:
+            col = find_plot_column(pname)
+            is_error = None if col is None else col.Type in (_COM_COLTYPE_Y_ERROR, _COM_COLTYPE_X_ERROR)
+        except Exception:
+            is_error = None
         infos.append({"name": pname, "is_error": is_error})
+    unknown = [p['name'] for p in infos if p['is_error'] is None]
+    if strict and unknown:
+        raise ValueError(f"Cannot classify plots on {graph_name}: {', '.join(unknown)}. Refusing an indexed or styled edit; inspect source and error-bar roles first.")
     return infos
 
 
@@ -239,12 +315,11 @@ def require_data_plots(graph_name: str) -> tuple[list, list]:
     data_names = [p["name"] for p in infos if not p["is_error"]]
     if not data_names:
         msg = (
-            f"No editable data plots found on '{graph_name}' — its layer "
-            f"reports zero plots even after activating the window. This graph "
-            f"was most likely loaded from a project file (.opju) in a state "
-            f"Origin will not expose over COM. Recreate it in-session "
-            f"(create_graph / plotxy) or reopen the project fresh; refusing to "
-            f"report success on an edit that would silently do nothing."
+            f"No editable data plots found on '{graph_name}' after activating "
+            f"the window. The layer may be empty, still updating, or frozen "
+            f"after project loading; Origin exposes no curves to COM. Recreate "
+            f"the plot in-session or reopen the project, then inspect it; "
+            f"refusing to report success on an edit that would silently do nothing."
         )
         raise ValueError(msg)
     return infos, data_names
@@ -257,7 +332,27 @@ def graph_layer_execute(graph_name: str, script: str) -> bool:
     FRESH layer handle is taken before every call — this is what unfreezes
     ``layer.*`` and per-plot commands on graphs loaded from a project file.
     """
-    gl = acquire_graph_layer(graph_name)
+    try:
+        gl = acquire_graph_layer(graph_name)
+    except Exception as com_exc:
+        if not is_session_created_graph(graph_name):
+            raise
+        # The fallback is limited to this session's own graph. Verify the
+        # active page name before sending a global LabTalk write so it cannot
+        # land on a different graph or worksheet.
+        activate_window(graph_name, "graph_name")
+        active = get_lt_str("page.name$")
+        if active != graph_name:
+            raise RuntimeError(
+                f"Layer COM access failed for '{graph_name}' and its page is "
+                f"not active (active page: {active!r}); no LabTalk style command was sent."
+            ) from com_exc
+        if not execute_labtalk(script):
+            raise RuntimeError(
+                f"Layer COM access failed for '{graph_name}', and Origin rejected "
+                "the guarded active-page LabTalk fallback."
+            ) from com_exc
+        return True
     return gl.Execute(script)
 
 

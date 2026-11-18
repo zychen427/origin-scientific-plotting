@@ -1,5 +1,9 @@
 # LabTalk Gotchas
 
+## 验证基线
+- 已验证：Origin 2020（上游历史验证；具体工作流见本 skill 内文）（上游 LabTalk 观察记录）
+- 未验证：Origin 2026 上的原始 LabTalk 边界情形未系统复测
+
 The full, probe-verified ledger of LabTalk/COM quirks discovered while
 building and hardening this server (Origin Pro 2020). `run_labtalk`'s
 docstring keeps only a short safety-critical list at the point of use; this
@@ -129,9 +133,10 @@ string `"missing"` instead of leaking the raw float.
 ## Missing-value cells: `0/0`, not `NANUM`
 
 To write an Origin missing-value cell from LabTalk, use
-`col(<c>)[<r>]=0/0;` — `NANUM` is a no-op on this build. `set_worksheet_data`
-does this for you when a cell is `null`/`NaN` in the input; it also checks
-the write actually landed before reporting success.
+`col(<c>)[<r>]=0/0;` — `NANUM` is a no-op on this build. In dev4,
+`set_worksheet_data` writes Origin's documented numeric missing marker through
+COM and verifies missing cells by reading them back; this route has been tested
+with synthetic data on Origin 2026. Other versions need independent verification.
 
 ## Hard limitations (no scriptable route exists)
 

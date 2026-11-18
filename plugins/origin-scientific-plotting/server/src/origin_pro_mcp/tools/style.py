@@ -7,7 +7,7 @@ from ..origin_connection import (
 )
 from ..labtalk_safe import (
     labtalk_choice, labtalk_name, labtalk_string, positive_int,
-    validate_text_escapes,
+    validate_text_escapes, mixed_chinese_font, default_axis_title,
 )
 from .style_helpers import (
     _collect_xy,
@@ -31,16 +31,15 @@ from .style_helpers import (
 # do not resurrect it.
 SYMBOL_SHAPES = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6}  # square, circle, tri-up, tri-down, diamond, plus
 
-# Default palette: muted/pastel RGB tones (no pure primaries — easier on
-# the eyes, survives grayscale, colorblind-distinguishable). Applied via
-# LabTalk color(r,g,b), verified working on Origin Pro 2020.
+# Contrasting categorical starting palette. Verify color and symbol distinction
+# after rendering; distinguish series without relying only on color.
 PASTEL_RGB = [
-    (93, 143, 179),   # soft steel blue
-    (204, 102, 119),  # muted rose
-    (68, 170, 153),   # muted teal
-    (221, 170, 102),  # soft amber
-    (153, 136, 187),  # soft purple
-    (119, 170, 187),  # gray cyan
+    (0, 114, 178),    # deep blue
+    (213, 94, 0),     # vermilion
+    (0, 158, 115),    # blue-green
+    (204, 121, 167),  # purple-rose
+    (86, 180, 233),   # sky blue
+    (120, 120, 120),  # neutral grey
 ]
 
 COLOR_MAP = {
@@ -54,16 +53,14 @@ COLOR_MAP = {
 _WIDTH_UNITS_PER_POINT = 200
 
 # Publication-style line/symbol defaults for apply_publication_style,
-# tuned visually on Origin 2020 for journal figures. Edit these to match
-# your lab's taste — bigger symbols and heavier error bars read better in
-# print than Origin's thin defaults.
-_PUB_LINE_WIDTH_PT = 3.0        # data series line width (points)
-_PUB_SYMBOL_SIZE = 14           # data symbol size
+# starting points only; adjust to canvas dimensions and final output size.
+_PUB_LINE_WIDTH_PT = 1.5        # data series line width (points)
+_PUB_SYMBOL_SIZE = 7           # data symbol size
 # Error-bar geometry. `set -erw` is in POINTS (unlike the data line's
 # `-w`, which is ~200 units/pt), and `-erwc` is the cap (whisker) width.
 # Both verified on Origin 2020 — earlier "blow-ups" were a units mistake
 # (passing -w-scale values into -erw), not an Origin limitation.
-_PUB_ERROR_BAR_WIDTH_PT = 2.5            # error-bar line width (points, via -erw)
+_PUB_ERROR_BAR_WIDTH_PT = 1.0            # error-bar line width (points, via -erw)
 _PUB_ERROR_CAP_WIDTH = _PUB_SYMBOL_SIZE - 2   # cap width, matched to symbol size
 
 
@@ -144,27 +141,38 @@ def _tight_axis_cmds(
 
 
 def _set_axis_title_verified(
-    graph_name: str, obj: str, label_text: str, font_size: int = 28
+    graph_name: str, obj: str, label_text: str, font_size: int = 18
 ) -> bool:
-    """Write an axis-title text object (``xb`` bottom-X / ``yl`` left-Y), bold
-    Times New Roman, then CONFIRM it landed by reading ``<obj>.text$`` back.
+    """Write an axis-title text object (``xb`` bottom-X / ``yl`` left-Y),
+    bold Times New Roman with SimSun Han runs, then CONFIRM it landed by reading ``<obj>.text$`` back.
 
     Origin's active-window text-object writes can silently hit the wrong window
     or no-op on the new-page settle race — the exact bug that left
     apply_publication_style's titles reading back as the ``%(?X)`` column-name
-    placeholder while the tool claimed "Times New Roman bold labels" (usability agent,
+    placeholder while the tool claimed "Times New Roman axis labels" (usability agent,
     3/3). LabTalk returns success either way, so success is gated on the
     read-back actually containing the label words, with an activate + settle
     retry. Returns True when verified, False otherwise (caller must NOT claim
     the label was set)."""
-    safe = labtalk_string("\\b(" + label_text + ")", obj)
+    formatted = default_axis_title(label_text)
+    safe = labtalk_string(formatted, obj)
     for attempt in range(3):
         activate_window(graph_name, "graph_name")
         execute_labtalk(
             f'{obj}.text$ = {safe}; {obj}.fsize = {font_size}; {obj}.font$ = "Times New Roman";'
         )
         got = get_lt_str(f"{obj}.text$") or ""
-        if label_text in got:
+        # Origin may canonicalize the font name to a localized display name,
+        # e.g. "SimSun" to "默认: 宋体". Check bold markup, Han-font run,
+        # and the original visible text after removing the font wrappers.
+        import re
+        unwrapped = re.sub(r"\\f:[^(]+\(([^()]*)\)", r"\1", got)
+        # Origin serializes literal parentheses as character-code escapes.
+        unwrapped = unwrapped.replace(r"\(40)", "(").replace(r"\(41)", ")")
+        han_requested = mixed_chinese_font(label_text) != label_text
+        font_ok = (not han_requested or
+                   ("\\f:" in got and ("SimSun" in got or "宋体" in got)))
+        if "\\b(" in got and font_ok and label_text in unwrapped:
             return True
         if attempt < 2:
             time.sleep(0.3)
@@ -184,60 +192,22 @@ def set_plot_style(
     error_bar_width: float | None = None,
     error_cap_width: float | None = None,
 ) -> str:
-    """Set line/symbol/error-bar style for a data plot. Only the aspects you
-    pass are touched — everything else on that curve is left exactly as it
-    was.
+    """Style one data plot (line/symbol/error bars); unset args untouched.
+    UNGROUPED plots only (else ungroup_plots() first); never batch `set` flags.
 
     Args:
-        graph_name: Graph name
-        plot_index: Data series index (1-based, order the datasets were
-                    added; error-bar plots are not counted)
-        line_width: Line width in points (None = leave unchanged)
-        symbol_size: Symbol size (None = leave unchanged; not validated —
-                     Origin accepts any positive value, roughly 3-20 is the
-                     readable range)
-        symbol_shape: 0=auto (uses SYMBOL_SHAPES's per-plot-index default), else
-                      the LabTalk `-k` code, RE-VERIFIED live on Origin 2020:
-                      1=square, 2=circle, 3=triangle-up, 4=triangle-down,
-                      5=diamond, 6=plus, 7=x/cross, 8=asterisk. (9-12 render as
-                      a dash/vertical-bar/literal digit-or-letter glyph, not
-                      useful marker shapes — avoid them.) None = leave unchanged.
-        color: Color name (black, red, green, blue, cyan, magenta, yellow,
-               orange, purple, gray/grey). "" = leave unchanged.
-        rgb: Explicit "r,g,b" (each 0-255), e.g. "128,0,200", for per-curve
-             rainbow/gradient colors that named colors can't express. Overrides
-             `color` when given. "" = leave unchanged. Note: `add_second_y_axis`'s
-             `color` param uses this same "r,g,b" numeric form, not a named color.
-        open_symbol: True = open/hollow marker interior (publication standard),
-                     False = solid fill (LabTalk `set -kf 1` vs `0`). None =
-                     leave unchanged.
-        error_bar_width: Error-bar LINE width in POINTS (LabTalk `-erw`, NOT
-                     the same unit scale as `line_width`'s `-w`). None = leave
-                     unchanged. Requires the plot to have an adjacent error
-                     bar (from y_error_col or set_error_bars).
-        error_cap_width: Error-bar CAP (whisker) width (LabTalk `-erwc`). None
-                     = leave unchanged. Same adjacency requirement as above.
-
-    GOTCHA (probe-verified, Origin 2020): every LabTalk flag below is sent as
-    its OWN `set <ds> -flag val;` call — combining e.g. `-c` and `-cf` (or
-    `-k`+`-kf`+`-z`) into ONE `set` command silently resets the plot to BLACK
-    or blanks the symbol. Never batch flags yourself via run_labtalk either.
-
-    NOTE on grouping: per-curve color/width/symbol/fill ALL apply only on
-    UNGROUPED plots (probe-confirmed — the earlier claim that line_width/
-    symbol still apply while grouped was WRONG). create_graph +
-    add_plot_to_graph build ungrouped plots (fine). If this call's result
-    looks right (the exported curve actually changed), the plot was already
-    ungrouped — no action needed. Only when a change here has NO visible
-    effect, on a grouped multi-curve plot (loaded project, or a single
-    multi-Y plotxy) that shares one color/style increment, call
-    ungroup_plots(graph_name) first, then re-style.
-
-    Returns:
-        Success message. Raises ValueError if no aspect was given, or if
-        plot_index is out of range, or if error_bar_width/error_cap_width is
-        requested but the plot has no error bars.
-    """
+        graph_name: graph. plot_index: 1-based data index; error bars not
+            counted.
+        line_width: POINTS. symbol_size: ~3-20, unchecked.
+        symbol_shape: 0=auto, else `-k`: 1 square, 2 circle, 3/4 triangle
+            up/down, 5 diamond, 6 plus, 7 x/cross, 8 star (9-12 bad).
+        color: named (red, blue, green, ...); ""=leave.
+            rgb: "r,g,b" 0-255, overrides color; ""=leave.
+        open_symbol: True=hollow, False=solid. Above: None=leave.
+        error_bar_width, error_cap_width: error-bar line/cap width in POINTS
+            (`-erw`/`-erwc`, NOT the `-w` scale of line_width); needs error
+            bars. None=leave.
+    Returns success; ValueError on no aspect, bad index, or no error bars."""
     import time
     safe_graph_name = labtalk_name(graph_name, "graph_name")
     require_graph(safe_graph_name)
@@ -413,23 +383,16 @@ def _parse_rgb(rgb: str):
 
 @mcp.tool()
 def ungroup_plots(graph_name: str, plot_type: str = "line") -> str:
-    """Break a plot group so each curve can be colored independently.
+    """Break a plot group so each curve can be styled independently.
 
-    Origin 2020 has NO working ungroup command: `layer -g` only GROUPS (there is
-    no ungroup toggle), verified exhaustively. While plots are grouped, the
-    group's color increment overrides per-curve `set_plot_style` color. The only
-    reliable fix (spike-verified on Origin 2020) is to remove the grouped plots
-    and re-plot each source dataset on its own — separate plots are NOT grouped.
-    This preserves the data and the X axis but RESETS each curve to `plot_type`
-    (re-style afterward with set_plot_style). Best used before styling.
+    No ungroup command exists (`layer -g` only groups): grouped plots are
+    REMOVED and each dataset re-plotted alone. Data and X axis survive but
+    every curve RESETS to `plot_type`: re-style afterwards.
 
     Args:
-        graph_name: Graph name.
-        plot_type: Plot type for the rebuilt curves: line, scatter, line+symbol.
-
-    Returns:
-        Confirmation with the rebuilt plot count.
-    """
+        graph_name: graph. plot_type: line, scatter or line+symbol, for the
+            rebuilt curves.
+    Returns the rebuilt plot count."""
     safe_graph = labtalk_name(graph_name, "graph_name")
     require_graph(safe_graph)
     codes = {"line": 200, "scatter": 201, "line+symbol": 202}
@@ -496,36 +459,23 @@ def apply_publication_style(
     legend_position: str = "top-right",
     modify_source_labels: bool = False
 ) -> str:
-    """Apply complete publication styling to a graph in ONE call.
+    """Apply a restrained starting style: bold axis titles; Times New Roman Latin and SimSun Han text,
+    accessible contrasting palette, 1.5 pt data lines, inward ticks,
+    closed frame, and borderless legend. Inspect at final size and adjust.
 
-    Sets bold Times New Roman labels, a muted pastel color palette, 2.5 pt lines,
-    readable tick spacing, inward ticks, closed frame, and a borderless
-    legend all at once. Designed to minimize token usage — call this
-    once instead of many separate tools.
-
-    NOTE: per-curve COLOR, WIDTH, and SYMBOL all apply only on UNGROUPED plots
-    (probe-confirmed — a grouped plot's shared style increment overrides color
-    AND width AND symbol, not just color). Graphs built with create_graph +
-    add_plot_to_graph are ungrouped (fine). A grouped multi-curve plot (loaded
-    from a project, or a single multi-Y plotxy) will NOT take the palette —
-    call ungroup_plots(graph_name) first, then this. Axes/frame/labels apply
-    either way.
+    Per-curve COLOR/WIDTH/SYMBOL apply only on UNGROUPED plots: a grouped
+    multi-curve plot will NOT take the palette - call ungroup_plots() first.
+    Axes/frame/labels apply either way.
 
     Args:
-        graph_name: Graph name
-        x_label: X axis label with units, e.g. "Temperature (K)"
-        y_label: Y axis label with units, e.g. "Absorbance (a.u.)"
-        x_min: X axis minimum (None=preserve current bound)
-        x_max: X axis maximum (None=preserve current bound)
-        y_min: Y axis minimum (None=preserve current bound)
-        y_max: Y axis maximum (None=preserve current bound)
-        legend_entries: Comma-separated entries; changes source worksheet column Long Names.
-        modify_source_labels: Must be True to permit that source-column change.
-        legend_position: top-left, top-right, bottom-left, bottom-right
-
-    Returns:
-        Summary of applied styling
-    """
+        graph_name: graph.
+        x_label, y_label: axis labels WITH units, e.g. "Temperature (K)".
+        x_min, x_max, y_min, y_max: axis bounds (None = keep current).
+        legend_entries: comma-separated entries; REWRITES the source column
+            Long Names, so modify_source_labels must be True.
+        modify_source_labels: permit that source-column change.
+        legend_position: top-left, top-right, bottom-left, bottom-right.
+    Returns a summary of the applied styling."""
     if legend_entries and not modify_source_labels:
         raise ValueError("Custom legend entries change source column Long Names; pass modify_source_labels=True only if that change is intended.")
     safe_graph_name = labtalk_name(graph_name, "graph_name")
@@ -538,10 +488,10 @@ def apply_publication_style(
     activate_window(safe_graph_name, "graph_name")
     plot_infos = get_plot_info(safe_graph_name)
 
-    # 1. Axis titles — bold, Times New Roman 28pt. Written through the read-back-gated
+    # 1. Axis titles — bold Times New Roman / SimSun 18pt. Written through the read-back-gated
     # helper: the old bare active-window writes silently dropped the labels on
     # the settle race (titles stayed the %(?X) column-name placeholder) while
-    # the return still claimed "Times New Roman bold labels". label_unverified collects
+    # the return still claimed "Times New Roman axis labels". label_unverified collects
     # any axis whose title could not be confirmed so the return tells the truth.
     label_unverified: list[str] = []
     if x_label:
@@ -553,16 +503,21 @@ def apply_publication_style(
         if not _set_axis_title_verified(safe_graph_name, "yl", y_label):
             label_unverified.append("y")
 
+    # Bold existing titles as well when labels were omitted, without replacing text.
+    for obj, supplied in (("xb", x_label), ("yl", y_label)):
+        if not supplied:
+            _bold_text_object(obj)
+
     # Step returns are now checked: a FRAME or TICK failure raises (those are
     # structural — a "publication style" without a frame is misleading), while a
     # purely cosmetic failure (tick-label font, grid removal) is noted in the
     # return rather than aborting the whole call.
     cosmetic_notes: list[str] = []
 
-    # 2. Tick labels — bold, Times New Roman 22pt (cosmetic)
-    if not graph_layer_execute(safe_graph_name, 'layer.x.label.pt = 22; layer.y.label.pt = 22;'):
+    # 2. Tick labels — regular Times New Roman 14pt (cosmetic)
+    if not graph_layer_execute(safe_graph_name, 'layer.x.label.pt = 14; layer.y.label.pt = 14;'):
         cosmetic_notes.append("tick-label size")
-    if not graph_layer_execute(safe_graph_name, 'layer.x.label.bold = 1; layer.y.label.bold = 1;'):
+    if not graph_layer_execute(safe_graph_name, 'layer.x.label.bold = 0; layer.y.label.bold = 0;'):
         cosmetic_notes.append("tick-label bold")
     if not graph_layer_execute(safe_graph_name, 'layer.x.label.font = font(Times New Roman); layer.y.label.font = font(Times New Roman);'):
         cosmetic_notes.append("tick-label font family")
@@ -581,15 +536,15 @@ def apply_publication_style(
     if not graph_layer_execute(safe_graph_name,
         "layer.x.ticks = 1; layer.y.ticks = 1; "
         "layer.x.minor = 1; layer.y.minor = 1; "
-        "layer.x.majorLen = 8; layer.y.majorLen = 8;"
+        "layer.x.majorLen = 5; layer.y.majorLen = 5;"
     ):
         msg = f"Could not set inward ticks on {safe_graph_name}."
         raise ValueError(msg)
 
-    # 5. Frame — closed (4 sides), thick (structural → raise)
+    # 5. Frame — closed (4 sides), moderate thickness (structural → raise)
     if not graph_layer_execute(safe_graph_name,
         "layer.x.opposite = 1; layer.y.opposite = 1; "
-        "layer.x.thickness = 2; layer.y.thickness = 2;"
+        "layer.x.thickness = 1; layer.y.thickness = 1;"
     ):
         msg = f"Could not close/thicken the frame on {safe_graph_name}."
         raise ValueError(msg)
@@ -601,7 +556,7 @@ def apply_publication_style(
     ):
         cosmetic_notes.append("grid removal")
 
-    # 7. Auto-style each data plot with a muted pastel palette + distinct
+    # 7. Auto-style each data plot with a contrasting palette + distinct
     # symbols. Error-bar plots only get the color of their data plot —
     # symbol/line commands would redraw them as connected lines.
     # P8 HARD RULE (probe-verified): every flag is its OWN `set <ds> -flag
@@ -644,7 +599,7 @@ def apply_publication_style(
         entry_list = [f"\\b({e.strip()})" for e in legend_entries.split(",")]
         set_legend_entries(safe_graph_name, entry_list)
         time.sleep(0.3)
-    execute_labtalk('legend.fsize = 20; legend.font$ = "Times New Roman"; legend.background = 0;')
+    execute_labtalk('legend.fsize = 14; legend.font$ = "Times New Roman"; legend.background = 0;')
     placement = place_legend_avoiding_data(safe_graph_name, safe_legend_position)
 
     moved_out = " — moved outside the frame to avoid the data" if placement.startswith("outside") else ""
@@ -674,25 +629,25 @@ def apply_publication_style(
         )
     requested_labels = [a for a, lbl in (("x", x_label), ("y", y_label)) if lbl]
     if not requested_labels:
-        labels_phrase = "Times New Roman bold labels"
+        labels_phrase = "bold axis titles (existing text retained)"
     elif label_unverified:
         labels_phrase = (
-            f"Times New Roman bold ticks (WARNING: the {', '.join(label_unverified)}-axis "
+            f"Times New Roman tick labels (WARNING: the {', '.join(label_unverified)}-axis "
             f"label(s) could NOT be verified — Origin read them back unchanged, "
             f"so they were most likely dropped; set them again with "
             f"axis(op='labels'))"
         )
     else:
-        labels_phrase = "Times New Roman bold labels (text verified; font rendering requires visual check)"
+        labels_phrase = "bold axis titles (text verified; mixed fonts require visual check)"
     cosmetic_note = (
         f"; NOTE: these cosmetic steps did not take: {', '.join(cosmetic_notes)}"
         if cosmetic_notes else ""
     )
     return (
         f"Publication style applied to {safe_graph_name}: "
-        f"{data_index} data plots styled (pastel palette, {_PUB_LINE_WIDTH_PT} pt lines), "
+        f"{data_index} data plots styled (contrasting palette, {_PUB_LINE_WIDTH_PT} pt lines), "
         f"{labels_phrase}, inward ticks, closed frame, no grid, "
-        f"borderless bold legend ({placement}){moved_out}{grouping_note}{cosmetic_note}"
+        f"borderless legend ({placement}){moved_out}{grouping_note}{cosmetic_note}"
     )
 
 
@@ -739,34 +694,22 @@ def _bold_text_object(obj: str) -> None:
 def set_graph_font(
     graph_name: str,
     font_name: str = "Times New Roman",
-    font_size: int = 24,
+    font_size: int = 18,
     target: str = "all",
-    bold: bool = False,
+    bold: bool | None = None,
 ) -> str:
-    """Set font for graph elements.
+    """Set the font family and size of graph text elements.
 
     Args:
-        graph_name: Graph name
-        font_name: Font family (default Times New Roman)
-        font_size: Font size in points (default 24)
-        target: "all", "axes", "title", "legend", "tick"
-        bold: Bold the targeted element(s). Axis titles and the graph title are
-              bolded via `\\b(...)` markup; tick labels honor this flag directly
-              (bold=False now leaves them un-bold, instead of the previous
-              always-bold behavior).
-
-    Note: for the "tick" (and "all") target, tick labels are sized at
-    max(font_size - 4, 16) — a step smaller than the axis titles, the usual
-    publication proportion; pass a larger font_size to enlarge them.
-
-    On a graph LOADED from a .opju the axis-title/legend font writes are now
-    read back (the size is confirmed) — live-verified reliable once the page is
-    activated, and it raises instead of reporting a false success if the write
-    is silently frozen.
-
-    Returns:
-        Success message; font family should be visually checked on the target Origin version.
-    """
+        graph_name: graph.
+        font_name: font family (default "Times New Roman").
+        font_size: POINTS (default 18); for target "tick"/"all" tick labels get
+            max(font_size-4, 12), one step below the axis titles.
+        target: "all", "axes", "title", "legend", "tick".
+        bold: None = default bold axis titles only; True = bold all targeted
+            objects; False = do not apply bold (does not remove existing markup).
+    Returns a success message; check the font family visually on the target
+    Origin version."""
     safe_graph_name = labtalk_name(graph_name, "graph_name")
     safe_font_name = labtalk_string(font_name, "font_name")
     safe_font_size = positive_int(font_size, "font_size")
@@ -784,7 +727,7 @@ def set_graph_font(
         if not execute_labtalk(f"yl.font$ = {safe_font_name}; yl.fsize = {safe_font_size};"):
             msg = f"Could not set the y-axis title font on {safe_graph_name}."
             raise ValueError(msg)
-        if bold:
+        if bold is not False:
             _bold_text_object("xb")
             _bold_text_object("yl")
         # Read-back gate: LabTalk returns success even if the write hit the wrong
@@ -795,7 +738,7 @@ def set_graph_font(
     if safe_target in ("all", "tick"):
         if not graph_layer_execute(safe_graph_name, f"layer.x.label.font = font({safe_font_name}); layer.y.label.font = font({safe_font_name});"):
             raise ValueError(f"Could not set tick-label font family on {safe_graph_name}.")
-        tick_size = max(safe_font_size - 4, 16)
+        tick_size = max(safe_font_size - 4, 12)
         if not graph_layer_execute(safe_graph_name, f"layer.x.label.pt = {tick_size}; layer.y.label.pt = {tick_size};"):
             msg = f"Could not set tick label font size on {safe_graph_name}."
             raise ValueError(msg)
@@ -808,7 +751,7 @@ def set_graph_font(
             raise ValueError(msg)
 
     if safe_target in ("all", "legend"):
-        legend_size = max(safe_font_size - 4, 16)
+        legend_size = max(safe_font_size - 4, 12)
         if not execute_labtalk(f"legend.font$ = {safe_font_name}; legend.fsize = {legend_size};"):
             msg = f"Could not set the legend font on {safe_graph_name}."
             raise ValueError(msg)
@@ -833,22 +776,15 @@ def set_legend(
     entries: str = "",
     modify_source_labels: bool = False
 ) -> str:
-    """Configure graph legend.
+    """Show or hide a graph legend and place it.
 
     Args:
-        graph_name: Graph name
-        visible: Show or hide legend
-        position: top-left, top-right, bottom-left, bottom-right
-        entries: Comma-separated custom legend entries; changes source column Long Names.
-        modify_source_labels: Must be True to permit that source-column change.
-
-    On a graph loaded from a .opju the legend rebuild is read back (the legend
-    object's presence is confirmed) — live-verified reliable once the page is
-    activated; a missing legend returns a WARNING rather than a clean success.
-
-    Returns:
-        Success message
-    """
+        graph_name: graph. visible: show or hide the legend.
+        position: top-left, top-right, bottom-left, bottom-right.
+        entries: comma-separated custom entries; REWRITES source column Long
+            Names, so modify_source_labels must be True.
+        modify_source_labels: permit that source-column change.
+    Returns success; a missing legend gives a WARNING, not success."""
     if entries and not modify_source_labels:
         raise ValueError("Custom legend entries change source column Long Names; pass modify_source_labels=True only if that change is intended.")
     safe_graph_name = labtalk_name(graph_name, "graph_name")
@@ -970,31 +906,22 @@ def set_tick_labels(
     decimal_places: int | None = None,
     offset_pct: int | None = None,
 ) -> str:
-    """Format an axis's tick labels: numeric format, bold, decimal places, offset.
+    """Format an axis's tick labels: format, bold, decimals, offset.
 
-    For a log axis Origin already renders ticks as powers of ten (10^n) by
-    default — set the scale with axis(op="scale", scale="log10"); there is no
-    separate "powers10" tick format on this build. On a linear axis, use
-    format="scientific" for the 1E3 style or "decimal" for plain numbers.
+    A log axis already renders ticks as powers of ten: set the scale with
+    axis(op="scale", scale="log10") - this build has no "powers10" format. On
+    a linear axis use format="scientific" (1E3) or "decimal".
 
     Args:
-        graph_name: Graph name
-        axis: "x", "y", or "both" (default)
-        format: "decimal", "scientific", or "engineering" (None = leave)
-        bold: True/False to bold/unbold tick labels (None = leave)
-        decimal_places: Number of decimals to show, or -1 for auto (None = leave)
-        offset_pct: Perpendicular distance of the tick labels from the axis, in
-            % of the tick-label font size (the GUI's "Offset in % Point Size").
-            POSITIVE pulls the labels TOWARD the axis (smaller gap); negative
-            pushes them away; 0 is Origin's default. Applied to each axis's
-            perpendicular direction (x → vertical, y → horizontal), so it is the
-            single knob for the axis→tick-label gap. None = leave untouched. Use
-            a positive value to tighten Origin's default gap toward a
-            matplotlib-style look.
-
-    Returns:
-        Success message
-    """
+        graph_name: graph. axis: "x", "y" or "both" (default).
+        format: "decimal", "scientific" or "engineering" (None = leave).
+        bold: bold/unbold the labels (None = leave).
+        decimal_places: decimals to show, -1 = auto (None = leave).
+        offset_pct: gap from the axis in % of the label font size ("Offset in
+            % Point Size"); POSITIVE pulls labels TOWARD the axis, negative
+            pushes them away, 0 = Origin default; applied per axis direction
+            (x -> vertical, y -> horizontal). None = leave.
+    Returns a success message."""
     safe_graph = labtalk_name(graph_name, "graph_name")
     safe_axis = labtalk_choice(axis.lower(), {"x", "y", "both"}, "axis")
     require_graph(safe_graph)

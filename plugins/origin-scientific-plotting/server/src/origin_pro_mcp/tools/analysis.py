@@ -2,6 +2,7 @@ import json
 import math
 
 from ..app import mcp
+from ..missing import is_origin_missing
 from ..origin_connection import (
     activate_window,
     execute_labtalk,
@@ -13,7 +14,6 @@ from ..origin_connection import (
 )
 from ..labtalk_safe import labtalk_choice, labtalk_name, positive_column, positive_int
 
-_MISSING_MAGNITUDE = 1e100
 _SMOOTH_METHODS = {"sg": 1, "savitzky_golay": 1, "adjacent": 2, "average": 2, "binomial": 3}
 
 
@@ -36,7 +36,7 @@ def _read_column(book: str, sheet: str, col: int) -> list:
     for row in data:
         if col - 1 < len(row):
             v = row[col - 1]
-            if isinstance(v, (int, float)) and abs(v) < _MISSING_MAGNITUDE:
+            if isinstance(v, (int, float)) and math.isfinite(v) and not is_origin_missing(v):
                 vals.append(float(v))
     return vals
 
@@ -467,37 +467,22 @@ def transform(
     direction: str | None = None,
     local_points: int | None = None,
 ) -> str:
-    """Apply a numerical transform to an XY curve.
+    """Run a numerical transform on an XY curve.
 
     Args:
-        data_book, data_sheet: Source workbook and sheet.
-        x_col, y_col: X and Y column numbers (1-based).
-        method: Which transform to run:
-            - "integrate": area under the curve. Returns JSON {area}.
-            - "differentiate": dY/dX into a new column.
-            - "smooth": smoothing into a new column; uses window_size
-              (points, odd; default 5) and smooth_method (savitzky_golay
-              (default), adjacent, or binomial).
-            - "interpolate": resample onto evenly spaced X; uses num_points
-              (default 100) and interp_method (linear/spline/bspline/akima,
-              default linear). Returns JSON {sheet, x, y}.
-            - "fft": forward FFT spectrum. Returns JSON {spectrum_sheet,
-              dominant_frequency} (dominant_frequency is null when the
-              spectrum columns cannot be read back).
-            - "find_peaks": local-maximum peak search; uses direction
-              (positive/negative/both, default positive) and local_points
-              (neighborhood size, default 10). Returns JSON {peaks, count}.
-        window_size: Smoothing window in points (method="smooth").
-        smooth_method: savitzky_golay/adjacent/binomial (method="smooth";
-            default savitzky_golay).
-        num_points: Output point count (method="interpolate").
-        interp_method: linear/spline/bspline/akima (method="interpolate").
-        direction: positive/negative/both (method="find_peaks").
-        local_points: Local-maximum neighborhood (method="find_peaks").
-
-    Returns:
-        The result of the selected transform (see method above).
-    """
+        data_book, data_sheet: source workbook and sheet.
+        x_col, y_col: 1-based columns.
+        method: "integrate" (area -> {area}), "differentiate" (dY/dX, new
+            column), "smooth" (new column), "interpolate" (evenly spaced X ->
+            {sheet,x,y}), "fft" (-> {spectrum_sheet,dominant_frequency}),
+            "find_peaks" (maxima -> {peaks,count}).
+        window_size: smoothing window in points, odd (smooth; default 5);
+            smooth_method: savitzky_golay (default), adjacent or binomial.
+        num_points: output points (interpolate; default 100); interp_method:
+            linear (default), spline, bspline or akima.
+        direction: positive (default), negative or both (find_peaks);
+            local_points: local-maximum neighbourhood (default 10).
+    Returns the result (see method)."""
     safe_method = labtalk_choice(method.lower(), _TRANSFORM_METHODS, "method")
     if safe_method == "integrate":
         return _integrate_impl(data_book, data_sheet, x_col, y_col)
@@ -539,26 +524,15 @@ def stats(
     bin_size: float | None = None,
     equal_variance: bool | None = None,
 ) -> str:
-    """Compute statistics on worksheet columns.
+    """Column stats: describe/compare/bin
 
     Args:
-        data_book, data_sheet: Source workbook and sheet.
-        op: Which statistic to run:
-            - "column": descriptive stats for one column (uses col). Returns
-              JSON {mean, sd, se, variance, median, min, max, sum, n}.
-            - "compare_means": two-sample t-test between col and col2 (requires
-              col2; equal_variance default False). Returns JSON {t, df,
-              p_value, mean1, mean2, equal_variance}.
-            - "frequency": histogram-style counts for col (requires bin_min,
-              bin_max, bin_size). Returns JSON {sheet, bins}.
-        col: Primary column (1-based).
-        col2: Second column (op="compare_means").
-        bin_min, bin_max, bin_size: Bin range/width (op="frequency").
-        equal_variance: Assume equal variance (op="compare_means").
-
-    Returns:
-        The result of the selected statistic (see op above).
-    """
+        data_book, data_sheet: source. op: "column" -> mean/sd/se/variance/
+            median/min/max/sum/n, "compare_means" -> t/df/p_value/mean1/mean2/
+            equal_variance (t-test), "frequency" -> sheet/bins.
+        col: primary (1-based); col2: compare_means.
+        bin_min, bin_max, bin_size: range/width (frequency).
+        equal_variance: assume equal variance (compare_means, False)."""
     safe_op = labtalk_choice(op.lower(), _STATS_OPS, "op")
     if safe_op == "column":
         return _column_statistics_impl(data_book, data_sheet, col)

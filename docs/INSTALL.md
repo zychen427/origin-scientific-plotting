@@ -2,9 +2,9 @@
 
 ## 运行环境
 
-需要Windows、已安装并授权的Origin/OriginPro以及能使用pywin32的Windows Python。验证环境为OriginPro 2026、Python 3.10.4、MCP 1.29.1、pywin32 312、Pillow 12.3.0。Python 3.10以外的解释器和其他Origin版本需自行运行验证脚本，不能据此声称已通过测试。
+需要 Windows、已授权的 Origin 或 OriginPro，以及 Windows Python 3.10 或更高版本。实机测试使用 OriginPro 2026、Python 3.10.4、originpro 1.1.15 和 OriginExt 1.2.6。测试范围见[0.5.1 验证记录](../plugins/origin-scientific-plotting/UPGRADE-STATUS.md)。
 
-完整插件采用stdio MCP连接，由宿主展开`${PLUGIN_ROOT}`。`ORIGIN_PRO_MCP_VISIBLE=1`使Origin窗口可见；daemon模式为会话提供Origin实例，不能据此声称接管用户手动打开的任意窗口。已有项目应使用项目路径加载副本。
+完整插件采用 stdio MCP 连接，由宿主展开 `${PLUGIN_ROOT}`。每个会话启动独立的 Origin 实例，默认后端为 `originpro`。`ORIGIN_PRO_MCP_VISIBLE=1` 使会话窗口可见。已有项目应按路径加载副本。绘图和保存完成后，`release_origin_session` 检查保存状态，再正常退出该实例。
 
 ## 克隆与配置
 
@@ -14,7 +14,7 @@
 & .\.venv\Scripts\python.exe .\scripts\configure_runtime.py --python .\.venv\Scripts\python.exe
 ```
 
-也可以传入已有、依赖齐全的Windows Python的绝对路径。脚本会先检查平台、Python版本、MCP主要版本和所需依赖，再更新插件的`mcp.json`。修改前的配置保存在忽略上传的`.local-config/`目录。
+也可以传入已有、依赖齐全的 Windows Python 的绝对路径。脚本检查平台、解释器和依赖后，会把解释器和按版本区分的用户目录锁文件路径写入插件的 `mcp.json`。配置备份保存在 `.local-config/`。
 
 ## 安装插件
 
@@ -32,11 +32,11 @@ codex plugin add origin-scientific-plotting@origin-research-local
 ## 验证
 
 ```powershell
-& .\.venv\Scripts\python.exe .\plugins\origin-scientific-plotting\scripts\verify_plugin.py --output .\verification
-& .\.venv\Scripts\python.exe .\plugins\origin-scientific-plotting\scripts\verify_plugin.py --plot --output .\verification
+& .\.venv\Scripts\python.exe .\plugins\origin-scientific-plotting\scripts\verify_plugin.py --static-only --output .\verification
+& .\.venv\Scripts\python.exe .\plugins\origin-scientific-plotting\scripts\verify_plugin.py --originpro --plot --output .\verification
 ```
 
-默认检查文件、来源哈希、MCP握手、工具发现和Origin只读状态。`--plot`使用标注的合成数据创建双曲线，导出PNG并保存新`.opju`，不清空会话或覆盖已有文件。运行结果写入输出目录的`verification.json`。Windows应用运行权限不足时，沙箱中的后台进程可能无法启动；该结果不能直接推断Origin安装损坏。
+静态检查覆盖清单、图标和源码哈希。绘图测试会创建隔离实例，使用合成数据绘制双曲线、导出 PNG 并保存新项目。运行结果写入 `verification/verification.json`。
 
 ## 单独安装Skill
 
@@ -44,6 +44,4 @@ codex plugin add origin-scientific-plotting@origin-research-local
 
 ## 安装包
 
-`packages/origin-scientific-plotting-0.2.1.zip`包含一个完整插件目录及隐藏兼容清单，使用可移植的解释器占位配置。迁移到另一台机器前，应展开并配置其`mcp.json`，或使用仓库中的配置脚本配置检出目录后重新打包。解释器、虚拟环境与Origin许可证需要在本机自行提供。
-
-0.2.1 默认关闭现有项目自动保存和对话框自动关闭；启动器默认使用单独的用户目录 daemon 锁文件。需先停止旧版本的后台服务后再核验更新效果。
+下载[完整插件 ZIP](../packages/origin-scientific-plotting-0.5.1.zip)并解压到 Windows 本地目录，保留隐藏的 `.codex-plugin` 清单。安装 `server/requirements.txt` 后，在解压目录的 `mcp.json` 中将 `command` 指向该 Python 的绝对路径，并在 `env` 中设置本机独立的 `ORIGIN_PRO_MCP_LOCKFILE`。将本地市场的 `source.path` 指向解压的插件目录，再按上文安装。直接克隆仓库可使用配置脚本完成路径设置。

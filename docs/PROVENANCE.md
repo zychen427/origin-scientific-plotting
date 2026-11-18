@@ -2,7 +2,7 @@
 
 Origin COM控制实现来自：https://github.com/youngminsw/Origin-Pro-MCP 。
 
-来源提交：https://github.com/youngminsw/Origin-Pro-MCP/tree/1e9741af96c45bcac9e619c3ba32264bac6950e7 。本仓库包含在该上游提交基础上维护的本地修改和新增绘图指引；35 个打包源码文件及资源的实际哈希位于插件 `server/PROVENANCE.json`，该清单描述发布内容，并不声称与上游原始提交完全一致。原项目`pyproject.toml`和`requirements.txt`曾在本机固定MCP低于2的依赖；发布快照保留本机依赖元数据和实际验证版本，不将其说成完全未改动的原始Git提交。
+发布版在[上游提交 1e9741a](https://github.com/youngminsw/Origin-Pro-MCP/tree/1e9741af96c45bcac9e619c3ba32264bac6950e7)的基础上维护，包含会话隔离、绘图工作流与依赖调整。插件 `server/PROVENANCE.json` 记录当前发布的绘图服务源码和资源哈希。公开 0.5.1 分发版的绘图服务文件与已安装、实测的 0.5.1 逐字节一致，启动路径和测试配置可在本机设置。[0.5.1 验证记录](../plugins/origin-scientific-plotting/UPGRADE-STATUS.md)
 
 上游作者`youngminsw`的MIT声明位于插件`server/LICENSE`。本仓库自有插件说明、中文Skill和维护脚本适用仓库根目录MIT许可证，保留`zychen427`的声明。打包后插件同时保留其上游许可文件。
 

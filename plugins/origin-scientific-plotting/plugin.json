@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "origin-scientific-plotting",
-  "version": "0.2.1",
+  "version": "0.5.1",
   "description": "本机Origin科研绘图：数据导入、可编辑图形、样式调整和导出验证。",
   "author": {
     "name": "Personal research workspace"

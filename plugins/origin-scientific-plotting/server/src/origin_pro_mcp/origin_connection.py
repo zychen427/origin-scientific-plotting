@@ -41,30 +41,34 @@ def _close_instance(inst) -> None:
             break
 
 
-def set_session_origin(origin, factory=None, session_id=None) -> None:
+def set_session_origin(origin, factory=None, session_id=None, verified_target=None) -> None:
     """Bind a COM proxy to the current thread (daemon worker / test injection).
 
     ``factory`` (daemon sessions) is the zero-arg callable that launched this
-    session's OWN isolated instance. If the proxy later dies (e.g. the user
-    closes the window), ``get_origin`` re-runs it to relaunch a fresh isolated
-    instance — instead of falling back to the shared ``ApplicationSI``, which
-    could silently attach the agent to a DIFFERENT or user-opened Origin and
-    modify the user's work.
+    session's OWN isolated instance. An unresponsive existing proxy is reported
+    without replacing or closing its Origin. The factory is used only when no
+    proxy is bound, never as a fallback to a shared ApplicationSI server.
 
     ``session_id`` (daemon sessions) is stashed thread-locally so
     project-path changes on this worker can be reported to the daemon's session
     ledger without origin_connection importing the daemon (avoids a cycle).
     """
     _state.origin = origin
+    _state.created_graphs = set()
+    if factory is None and hasattr(_state, 'origin_pid'):
+        # A reconnect may create a different process; never report stale PID.
+        _state.origin_pid = None
     if factory is not None:
         _state.factory = factory
     if session_id is not None:
         _state.session_id = session_id
+    if verified_target is not None:
+        _state.verified_target = dict(verified_target)
 
 
 def clear_session_origin() -> None:
     """Drop the current thread's proxy and factory (full session teardown)."""
-    for attr in ("origin", "factory", "project_path", "session_id"):
+    for attr in ("origin", "factory", "project_path", "session_id", "origin_pid", "origin_process", "verified_target", "created_graphs"):
         if hasattr(_state, attr):
             delattr(_state, attr)
 
@@ -132,6 +136,46 @@ def get_remembered_project_path():
     return getattr(_state, "project_path", None)
 
 
+def get_session_identity():
+    """Return only thread-local session metadata; no process is opened or closed."""
+    import os
+    target = getattr(_state, 'verified_target', None)
+    return {'session_id': getattr(_state, 'session_id', None),
+            'worker_pid': os.getpid() if os.environ.get('ORIGIN_PRO_MCP_WORKER') == '1' else None,
+            'remembered_project_path': getattr(_state, 'project_path', None),
+            'origin_pid': getattr(_state, 'origin_pid', None) or (target or {}).get('pid'),
+            'origin_process': getattr(_state, 'origin_process', None) or target,
+            'verified_target': target}
+
+
+def remember_created_graph(name: str) -> None:
+    """Mark a graph created by this session for guarded LabTalk fallbacks."""
+    graphs = set(getattr(_state, "created_graphs", set()))
+    graphs.add(str(name))
+    _state.created_graphs = graphs
+
+
+def is_session_created_graph(name: str) -> bool:
+    """Whether ``name`` is a graph created by this live Origin session."""
+    return str(name) in getattr(_state, "created_graphs", set())
+
+
+def forget_created_graphs() -> None:
+    """Invalidate graph provenance when the current project is replaced."""
+    _state.created_graphs = set()
+
+
+def set_session_pid(pid):
+    _state.origin_pid = pid
+    _state.origin_process = None
+    if pid:
+        try:
+            from .existing_origin import _process_identity
+            _state.origin_process = _process_identity(int(pid))
+        except Exception:
+            pass
+
+
 def _reopen_remembered_project(origin) -> None:
     """Best-effort: reopen the remembered on-disk project into a freshly
     relaunched instance. A crash/close still drops unsaved edits, but the last
@@ -177,36 +221,11 @@ def get_origin():
             "then retry after inspecting the current project."
         )
     if origin is None:
-        factory = getattr(_state, "factory", None)
-        if factory is not None:
-            # Daemon session: relaunch THIS session's own isolated instance.
-            # Never fall through to ApplicationSI — that could hijack the user's
-            # open Origin or another session's instance.
-            origin = factory()
-            _state.origin = origin
-            # Recovery: if this thread had a project loaded before the proxy
-            # died, reopen it into the fresh instance (best-effort). On the
-            # first launch nothing is remembered yet, so this is a no-op.
-            _reopen_remembered_project(origin)
-            return origin
-        try:
-            import win32com.client
-            import pywintypes
-        except ModuleNotFoundError as exc:
-            msg = (
-                "Origin Pro COM automation requires Windows Python with pywin32. "
-                "Run this MCP server on Windows, not WSL/Linux."
-            )
-            raise RuntimeError(msg) from exc
-        try:
-            origin = win32com.client.Dispatch("Origin.ApplicationSI")
-        except pywintypes.com_error as exc:
-            raise RuntimeError(explain_com_error(exc)) from exc
-        try:
-            origin.Visible = _MAINWND_SHOW
-        except (AttributeError, pywintypes.com_error):
-            pass
-        set_session_origin(origin)
+        raise RuntimeError(
+            "No Origin instance is bound to this session. Refusing implicit "
+            "attachment or replacement; inspect the session and start a new "
+            "explicitly isolated session if needed."
+        )
     return origin
 
 def execute_labtalk(script: str) -> bool:
@@ -308,6 +327,14 @@ def activate_window(name: str, field: str = "window") -> None:
     so every tool must go through this guard before window-scoped commands.
     """
     safe_name = labtalk_name(name, field)
+    # A newly plotted graph is commonly already active. Skip the redundant
+    # `win -a` call on an exact page-name match; Origin 2026 can reject that
+    # call while finishing the first graph command.
+    try:
+        if get_lt_str("page.name$") == safe_name:
+            return
+    except Exception:
+        pass
     if not execute_labtalk(f"win -a {safe_name};"):
         books = ", ".join(workbook_names()) or "(none)"
         graphs = ", ".join(graph_names()) or "(none)"

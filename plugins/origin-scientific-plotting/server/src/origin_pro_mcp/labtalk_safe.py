@@ -75,6 +75,28 @@ def validate_text_escapes(value: str, field: str) -> None:
             )
 
 
+def mixed_chinese_font(value: str) -> str:
+    """Format literal Han characters as SimSun; surrounding Latin uses object font.
+
+    Respect explicitly supplied font escapes. Do not rewrite mathematical or
+    author-provided markup; the caller can supply an explicit font there.
+    """
+    if "\\f:" in value or not re.search(r"[\u3400-\u9fff\uf900-\ufaff]", value):
+        return value
+    def font_run(match):
+        run = match.group(0)
+        font = "SimSun" if re.match(r"[\u3400-\u9fff\uf900-\ufaff]", run) else "Times New Roman"
+        return "\\f:" + font + "(" + run + ")"
+    return re.sub(r"[\u3400-\u9fff\uf900-\ufaff]+|[A-Za-z0-9]+", font_run, value)
+
+
+
+def default_axis_title(value: str) -> str:
+    """Bold a title, adding SimSun to Han runs without overriding explicit font."""
+    rendered = mixed_chinese_font(value)
+    return rendered if rendered.startswith("\\b(") else "\\b(" + rendered + ")"
+
+
 def labtalk_text(value: str, field: str) -> str:
     """``labtalk_string`` for TEXT-OBJECT content (axis labels, titles,
     annotations): additionally rejects unsupported markup escapes that can
@@ -165,14 +187,14 @@ def labtalk_choice(value: str, allowed: Iterable[str], field: str) -> str:
 
 
 def positive_column(value: int, field: str) -> int:
-    if value < 1:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         msg = f"{field} must be a 1-based column index."
         raise ValueError(msg)
     return value
 
 
 def positive_int(value: int, field: str) -> int:
-    if value < 1:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         msg = f"{field} must be positive."
         raise ValueError(msg)
     return value

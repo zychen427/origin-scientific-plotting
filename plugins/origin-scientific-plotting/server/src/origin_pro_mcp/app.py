@@ -6,6 +6,17 @@ from .skills import SERVER_INSTRUCTIONS
 
 mcp = FastMCP("origin-pro", log_level="ERROR", instructions=SERVER_INSTRUCTIONS)
 
+# Advertise the plugin build (not the mcp SDK version) in initialize's
+# serverInfo.version, so each client can tell which code is serving it.
+# FastMCP does not expose a version argument; the low-level server defaults to
+# the SDK version when this attribute is left unset.
+try:  # pragma: no cover - private hook of an optional SDK version
+    from .build_version import CODE_VERSION
+
+    mcp._mcp_server.version = CODE_VERSION
+except Exception:  # pragma: no cover
+    pass
+
 # Cutover flag: Phase 3d FLIPPED this to True — the daemon-backed shim is now the
 # default entrypoint (auto-spawn + orphan self-cleanup). Force the legacy
 # in-process server with ORIGIN_PRO_MCP_USE_DAEMON=0.
@@ -28,5 +39,4 @@ def main():
 
         run_stdio()
         return
-    from . import server  # noqa: F401 — registers all tools
-    mcp.run(transport="stdio")
+    raise RuntimeError('In-process server mode is disabled; use the isolated worker daemon.')

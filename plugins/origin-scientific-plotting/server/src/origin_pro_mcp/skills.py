@@ -39,7 +39,12 @@ SERVER_INSTRUCTIONS = (
     "— do not work from memory alone. For any manuscript / journal / "
     "publication-quality figure, reading the `publication-figure` skill is "
     "required. Prefer the typed tools; use `run_labtalk` only for operations no "
-    "tool covers."
+    "tool covers. Origin control must use MCP COM interfaces; run_labtalk "
+    "executes via COM, not the Script Window. Do not silently switch to desktop "
+    "mouse, keyboard, coordinate clicks or typing in Origin's Script Window. "
+    "If COM is unavailable or the target window cannot be verified, report "
+    "the specific blocker rather than switching methods. Isolated sessions do "
+    "not automatically target a manually opened Origin project."
 )
 
 _SKILLS_CACHE: Optional[List[dict]] = None

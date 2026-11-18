@@ -4,9 +4,9 @@
 
 **在 Windows 本机通过自然语言控制 Origin/OriginPro，生成可编辑科研图。**
 
-本项目将 Origin MCP 接口与中文绘图 Skill 打包为 Codex 本地插件，覆盖数据读取、原生绘图、样式调整、图片导出和 `.opju` 项目保存。当前版本为 **0.2.1**。完整插件与独立 Skill 均提供源文件，可按研究项目调整工作流程。
+本项目将 Origin MCP 接口与中文绘图 Skill 打包为 Codex 本地插件，覆盖数据读取、原生绘图、样式调整、图片导出和 `.opju` 项目保存。当前版本为 **0.5.1**。完整插件与独立 Skill 均提供源文件，可按研究项目调整工作流程。
 
-[安装指南](#安装完整插件) · [独立 Skill](#单独使用-skill) · [使用示例](#使用示例) · [验证与演示](#验证与演示) · [常见问题](#常见问题) · [下载插件包](packages/origin-scientific-plotting-0.2.1.zip)
+[安装指南](#安装完整插件) · [独立 Skill](#单独使用-skill) · [使用示例](#使用示例) · [验证与演示](#验证与演示) · [常见问题](#常见问题) · [下载 0.5.1 插件包](packages/origin-scientific-plotting-0.5.1.zip)
 
 ## 功能范围
 
@@ -30,7 +30,7 @@
 | **完整插件，推荐** | 同时配置 Origin 工具与绘图流程 | MCP 启动配置、完整服务源码、内置 Skill、图标和验证脚本 |
 | **独立 Skill** | 本机已有可用的 Origin MCP 接口 | 中文绘图规则与流程，复用现有接口 |
 
-插件通过 Windows COM 接口控制本机 Origin，由 MCP 向 Codex 提供工具。`ORIGIN_PRO_MCP_VISIBLE=1`使 Origin 窗口可见；daemon 模式使用会话实例。已有项目应按路径加载副本，不能仅凭软件已打开就假定插件正在操作指定窗口。实现见[连接模块](plugins/origin-scientific-plotting/server/src/origin_pro_mcp/origin_connection.py)。
+每个 MCP 会话使用独立的 Python worker 和 Origin 实例，默认采用 OriginLab 的 `originpro` 后端。`ORIGIN_PRO_MCP_VISIBLE=1` 使会话窗口可见。已有项目按路径在隔离实例中加载副本。调用 `release_origin_session` 后，插件会检查保存状态和进程身份，再正常退出该实例。实现见[连接模块](plugins/origin-scientific-plotting/server/src/origin_pro_mcp/origin_connection.py)。
 
 ## 安装完整插件
 
@@ -41,10 +41,10 @@
 | 操作系统 | Windows；本插件调用 Windows COM |
 | Origin | 已安装并授权 Origin/OriginPro；实际验证版本为 **OriginPro 2026** |
 | Python | Windows Python；实际验证版本为 **3.10.4**。配置脚本接受 3.10 及以上，其他版本需另外验证 |
-| Python 依赖 | 已验证 **MCP 1.29.1、pywin32 312、Pillow 12.3.0**；依赖文件已固定这些版本 |
+| Python 依赖 | 已验证 **MCP 1.29.1、pywin32 312、Pillow 12.3.0、originpro 1.1.15**；完整依赖见 `requirements.txt` |
 | Codex 与 Git | 本机可运行 `codex`、`git`，Codex CLI 提供 `plugin marketplace`与 `plugin add`命令 |
 
-插件包含服务源码和资源。Python 解释器、虚拟环境与 Origin 许可证由本机提供。依赖见[`server/requirements.txt`](plugins/origin-scientific-plotting/server/requirements.txt)，验证记录见[`examples/verification.json`](examples/verification.json)。
+插件包含服务源码和资源。Python 解释器、虚拟环境与 Origin 许可证由本机提供。依赖见[`server/requirements.txt`](plugins/origin-scientific-plotting/server/requirements.txt)，实机记录见[0.5.1 验证记录](plugins/origin-scientific-plotting/UPGRADE-STATUS.md)。
 
 ### 克隆并配置 Python
 
@@ -88,15 +88,15 @@ codex plugin list --marketplace origin-research-local --json
 ### 验证 Origin 连接
 
 ```powershell
-& .\.venv\Scripts\python.exe .\plugins\origin-scientific-plotting\scripts\verify_plugin.py --output .\verification
+& .\.venv\Scripts\python.exe .\plugins\origin-scientific-plotting\scripts\verify_plugin.py --static-only --output .\verification
 ```
 
-该命令检查插件文件、来源哈希、MCP 握手、工具发现和 Origin 只读状态。查看 `verification/verification.json`中的最终状态。使用已有环境时，将命令开头替换为配置时选择的 Python 路径。
+该命令检查插件文件和来源哈希，无需打开 Origin。查看 `verification/verification.json` 中的最终状态。使用已有环境时，将命令开头替换为配置时选择的 Python 路径。
 
 完整绘图测试使用：
 
 ```powershell
-& .\.venv\Scripts\python.exe .\plugins\origin-scientific-plotting\scripts\verify_plugin.py --plot --output .\verification
+& .\.venv\Scripts\python.exe .\plugins\origin-scientific-plotting\scripts\verify_plugin.py --originpro --plot --output .\verification
 ```
 
 `--plot`使用明确标注的合成数据，在插件会话中创建双曲线、导出 PNG 并保存新的 `.opju`，文件名带随机后缀。该测试会创建 Origin 对象和输出文件，结果以实际文件和[验证脚本](plugins/origin-scientific-plotting/scripts/verify_plugin.py)报告为准。
@@ -140,7 +140,9 @@ origin-plotting/
 
 ## 验证与演示
 
-下表记录 2026-10-08 的 0.1.2 本机验证，供了解验证方法；不代表 0.2.1 在所有环境完成同样测试：
+0.5.1 在 OriginPro 2026 中验证了两条 XY 曲线及两组 Y 误差棒、矩阵等高线、数据回读、项目保存并重开，以及保存后会话正常退出。矩阵缺失值的着色和插值含义仍需核对。[0.5.1 验证记录](plugins/origin-scientific-plotting/UPGRADE-STATUS.md)
+
+下表为 2026-10-08 的 0.1.2 演示记录。
 
 | 项目 | 实际结果 |
 | --- | --- |
@@ -190,7 +192,7 @@ python .\scripts\verify_distribution.py
 
 打包脚本同步独立 Skill 与内置 Skill，生成包含隐藏兼容清单的单目录 ZIP，并更新 `SHA256SUMS.json`。校验脚本检查文件哈希、两份 Skill 的一致性、上游源文件哈希与 ZIP 内容。
 
-配置脚本会更改 `mcp.json`中的 Python 路径，因此配置后分发清单可能与原始包不同；重新打包后再校验当前副本。已提交的[插件包](packages/origin-scientific-plotting-0.2.1.zip)提供可移植的解释器占位配置；使用前先配置自己机器的 Python 解释器。
+配置脚本会写入本机 Python 路径和当前版本的 daemon 锁文件路径。分发完整性校验应在配置前运行。[0.5.1 插件包](packages/origin-scientific-plotting-0.5.1.zip)使用可移植的解释器占位配置。
 
 ## 常见问题
 
@@ -213,12 +215,10 @@ python .\scripts\verify_distribution.py
 
 本仓库自有内容采用[MIT 许可证](LICENSE)。Origin 控制实现来自[youngminsw/Origin-Pro-MCP](https://github.com/youngminsw/Origin-Pro-MCP)，保留其[原始 MIT 声明](plugins/origin-scientific-plotting/server/LICENSE)。来源提交为[`1e9741a`](https://github.com/youngminsw/Origin-Pro-MCP/tree/1e9741af96c45bcac9e619c3ba32264bac6950e7)。
 
-包含本地维护修改的 35 个源码文件与资源的实际 SHA-256 位于[`server/PROVENANCE.json`](plugins/origin-scientific-plotting/server/PROVENANCE.json)。本机依赖元数据的调整和验证边界见[来源说明](docs/PROVENANCE.md)。
+绘图服务源码和资源的 SHA-256 位于[`server/PROVENANCE.json`](plugins/origin-scientific-plotting/server/PROVENANCE.json)。依赖和验证范围见[来源说明](docs/PROVENANCE.md)。
 
 如需反馈问题，可提交[GitHub Issue](https://github.com/zychen427/origin-scientific-plotting/issues)，说明 Windows、Origin、Python 和插件版本、操作步骤及实际错误；附图或验证记录前，应去除无关的实验信息和个人路径。
 
-## 0.2.1 更新
+## 0.5.1 更新
 
-本版默认不自动保存现有项目或自动关闭对话框；连接异常或超时不主动关闭 Origin。新建或加载项目需要明确 `replace_current=True`，导出不覆盖已有目标；自定义图例修改源列长名称时须明确授权。写入前校验列，Excel 导入新建独立工作簿，并提供绘图预检、常见图形和稀疏质谱绘图指引。详细限制见插件内 Skill 与工具说明。
-
-启动器默认使用当前用户目录下的独立 daemon 锁文件，避免误连接旧版服务；已存在的后台 daemon 可能仍运行旧代码。保存工作后重新启动相关 MCP 进程，再验证当前版本。
+修复了带 Y 误差棒建图和追加曲线时的绘图对象计数错误，并正确设置误差列角色。相比上一版 GitHub 包，每个会话现在有独立的 worker 和 Origin 实例，绘图任务保存后可通过显式释放工具正常退出。迁移时先保存旧会话的项目，并在新聊天中核实加载版本。

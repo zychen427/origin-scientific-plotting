@@ -3,7 +3,7 @@
   "mcpServers": {
     "origin-scientific-plotting": {
       "type": "stdio",
-      "command": "pythonw",
+      "command": "python",
       "args": [
         "${PLUGIN_ROOT}/server/launch.py"
       ],
@@ -11,6 +11,7 @@
       "env": {
         "ORIGIN_PRO_MCP_VISIBLE": "1",
         "ORIGIN_PRO_MCP_USE_DAEMON": "1",
+        "ORIGIN_PRO_MCP_BACKEND": "originpro",
         "PYTHONIOENCODING": "utf-8",
         "PYTHONDONTWRITEBYTECODE": "1",
         "ORIGIN_PRO_MCP_AUTOSAVE": "off",

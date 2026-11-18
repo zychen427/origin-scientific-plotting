@@ -214,26 +214,16 @@ def worksheet_to_matrix(
     cols: int = 20,
     matrix_book: str = ""
 ) -> str:
-    """Convert XYZ worksheet columns into a matrix by gridding (xyz2mat).
-
-    Enables 3D surface / contour / heatmap from scattered XYZ data.
+    """Grid XYZ worksheet columns into a matrix (xyz2mat) for 3D
+    surface/contour/heatmap.
 
     Args:
-        data_book: Source workbook name
-        data_sheet: Source sheet name
-        x_col: X column (1-based)
-        y_col: Y column (1-based)
-        z_col: Z column (1-based)
-        rows: Output matrix rows (default 20)
-        cols: Output matrix columns (default 20)
-        matrix_book: Optional name for the output matrix book
-
-    Returns:
-        JSON object: {"name": <actual matrix book name>, "requested_name":
-        <matrix_book if given, else null>, "renamed": <bool, true if Origin
-        uniquified the name>, "source": <"[data_book]data_sheet">, "rows":
-        <rows>, "cols": <cols>}
-    """
+        data_book, data_sheet: source workbook and sheet.
+        x_col, y_col, z_col: column numbers (1-based).
+        rows: output matrix rows (default 20). cols: columns (default 20).
+        matrix_book: optional output matrix book name.
+    Returns {name,requested_name,renamed,source,rows,cols} where "source" is
+    "[data_book]data_sheet"."""
     safe_book = labtalk_name(data_book, "data_book")
     safe_sheet = labtalk_name(data_sheet, "data_sheet")
     safe_x = positive_column(x_col, "x_col")
@@ -278,26 +268,17 @@ def create_matrix_plot(
     graph_name: str = "",
     z_label: str = ""
 ) -> str:
-    """Plot a matrix as a surface, contour, heatmap, or image.
+    """Plot a matrix book as a surface, contour, heatmap or image.
 
     Args:
-        matrix_book: Matrix book name (see create_matrix / worksheet_to_matrix)
-        plot_type: surface (3D), contour, heatmap, or image. surface/contour/
-                 heatmap carry a color scale (colorbar); "image" is a continuous
-                 per-cell map with NO colorbar (Origin cannot script one on). For
-                 a continuous map that KEEPS a colorbar, use heatmap + colormap(
-                 levels=64), not image (a default heatmap shows ~8 bands; levels
-                 smooths it while retaining the color scale).
-        graph_name: Optional name for the new graph
-        z_label: Optional Z label with units (e.g. "Intensity (a.u.)"); sets
-                 the matrix long name, which drives both the Z-axis title
-                 (3D) and the color-scale title.
-
-    Returns:
-        JSON object: {"name": <actual graph name>, "requested_name":
-        <graph_name if given, else null>, "renamed": <bool, true if the
-        actual name differs from the requested name>, "plot_type": <plot_type>}
-    """
+        matrix_book: matrix book name (see create_matrix/worksheet_to_matrix).
+        plot_type: "surface" (3D), "contour" or "heatmap" (each with a color
+            scale) versus "image" (per-cell map, NO colorbar). For a smooth map
+            with a colorbar use heatmap + colormap(levels=64).
+        graph_name: new graph name.
+        z_label: optional Z label ("Intensity (a.u.)"); sets the matrix long
+            name, driving the Z and colorbar titles.
+    Returns {name,requested_name,renamed,plot_type}."""
     safe_book = labtalk_name(matrix_book, "matrix_book")
     safe_type = labtalk_choice(plot_type, _MATRIX_PLOT_TYPES, "plot_type")
     pid = _MATRIX_PLOT_TYPES[safe_type]

@@ -11,6 +11,7 @@ from ..origin_connection import (
     get_lt_str,
     get_origin,
     graph_names,
+    remember_created_graph,
     require_graph,
     require_worksheet,
 )
@@ -104,31 +105,18 @@ def create_graph(
     title: str = "",
     template: str = ""
 ) -> str:
-    """Create a graph from worksheet data.
+    """Create a graph from worksheet columns.
 
     Args:
-        graph_name: Name for the graph window
-        data_book: Source workbook name
-        data_sheet: Source sheet name
-        x_col: X column number (1-based). Ignored for box/histogram.
-        y_col: Y column number (1-based)
-        plot_type: scatter, line, line+symbol, column, bar, area, pie,
-                   box, histogram, contour, 3d_scatter
-        y_error_col: Optional Y error column (1-based, 0=none). XY plots only.
-        z_col: Z column (1-based). REQUIRED for contour and 3d_scatter.
-        title: Optional graph title
-        template: Optional path to a saved Origin graph template (.otpu/.otp,
-                  e.g. from save_graph_template). When given, the new graph is
-                  built FROM that template so it reproduces the saved styling
-                  (frame, fonts, line/symbol style, colors) with this data.
-                  2D XY plot types only (not contour/3d_scatter).
-
-    Returns:
-        JSON string: {"name": <actual graph name>, "requested_name": <name
-        passed in>, "renamed": <bool, True if Origin uniquified the name>,
-        "plot_type": <plot type used>}. Use "name" for subsequent calls —
-        Origin renames on collision, so it may differ from requested_name.
-    """
+        graph_name: window name. data_book, data_sheet: source.
+        x_col: X (1-based); ignored for box/histogram. y_col: Y column.
+        plot_type: scatter, line, line+symbol, column, bar, area, pie, box,
+            histogram, contour, 3d_scatter.
+        y_error_col: 1-based (0 = none); XY only. z_col: REQUIRED for
+            contour and 3d_scatter. title: graph title.
+        template: optional .otpu/.otp path; built FROM it, with its styling;
+            2D XY only.
+    Returns {name,requested_name,renamed,plot_type}; use "name"."""
     o = get_origin()
     safe_graph_name = labtalk_name(graph_name, "graph_name")
     safe_book = labtalk_name(data_book, "data_book")
@@ -159,6 +147,32 @@ def create_graph(
                 "title.x = 50; title.y = 95;"
             )
 
+    # Use OriginLab's typed graph/page/layer objects for common XY figures.
+    # Specialized plot types and existing templates keep their proven route.
+    if (not template_path and safe_plot_type in {"scatter", "line", "line+symbol", "column"}
+            and safe_plot_type not in _Y_ONLY_TYPES | _XYZ_TYPES):
+        from ..originpro_backend import is_available as _originpro_available
+        if _originpro_available():
+            if y_error_col:
+                safe_error_col = positive_column(y_error_col, "y_error_col")
+                _designate_error_column(safe_book, safe_sheet, safe_error_col)
+            from ..originpro_backend import create_xy_graph
+            name = create_xy_graph(safe_graph_name, safe_book, safe_sheet,
+                                   safe_x_col, safe_y_col, safe_plot_type,
+                                   y_error_col=y_error_col)
+            activate_window(name, "graph_name")
+            remember_created_graph(name)
+            settle_new_plots(name, expected_min_plots=1)
+            _set_title()
+            return json.dumps({
+                "name": name,
+                "requested_name": safe_graph_name,
+                "renamed": name != safe_graph_name,
+                "plot_type": safe_plot_type,
+                "template": None,
+                "backend": "originpro",
+            })
+
     # --- XYZ plots: contour (2D) and 3d_scatter (OpenGL), via plotxyz ---
     if safe_plot_type in _XYZ_TYPES:
         if z_col < 1:
@@ -184,6 +198,7 @@ def create_graph(
                 f"win -r {name} {safe_graph_name};"
             ):
                 name = safe_graph_name
+            remember_created_graph(name)
             settle_new_plots(name, expected_min_plots=1)
         else:
             name = o.CreatePage(3, safe_graph_name, "origin")
@@ -196,6 +211,7 @@ def create_graph(
                     f"{safe_x_col}, {safe_y_col}, {safe_z_col} contain data."
                 )
                 raise ValueError(msg)
+            remember_created_graph(name)
             settle_new_plots(name, expected_min_plots=1)
         _set_title()
         return json.dumps({
@@ -227,6 +243,11 @@ def create_graph(
         # (probe-verified route: plotxy ... ogl:=<new template:="<path>">).
         # plotm/plotxy into <new template:=...> spawns its own window, so grab
         # the new page name by diffing the graph list, then rename to requested.
+        # Do not leave a user's existing graph active while invoking plotxy:
+        # some Origin versions can otherwise plot into the active graph
+        # despite ogl:=<new template:=...>. Never rename a pre-existing page
+        # when the expected new graph cannot be identified.
+        activate_window(safe_book, "data_book")
         before = set(graph_names())
         if not execute_labtalk(
             f'plotxy iy:={data_ref} plot:={ptype} '
@@ -239,7 +260,13 @@ def create_graph(
             )
             raise ValueError(msg)
         new = set(graph_names()) - before
-        name = new.pop() if new else o.LTStr("page.name$")
+        if len(new) != 1:
+            raise RuntimeError(
+                f"Template plot did not produce exactly one identifiable new graph "
+                f"(found {len(new)}). Inspect the project before retrying; "
+                "no existing graph was renamed by this tool."
+            )
+        name = new.pop()
         if name != safe_graph_name and execute_labtalk(
             f"win -r {name} {safe_graph_name};"
         ):
@@ -253,6 +280,7 @@ def create_graph(
                 f"data, and that plot_type '{safe_plot_type}' suits this data."
             )
             raise ValueError(msg)
+    remember_created_graph(name)
     settle_new_plots(name, expected_min_plots=1)
 
     _set_title()
@@ -311,13 +339,19 @@ def add_plot_to_graph(
         _designate_error_column(safe_book, safe_sheet, safe_error_col)
         data_ref = f"[{safe_book}]{safe_sheet}!({safe_x_col},{safe_y_col},{safe_error_col})"
 
-    if not execute_labtalk(f"plotxy iy:={data_ref} plot:={ptype} ogl:=[{safe_graph_name}]Layer1;"):
-        msg = (
-            f"Could not add plot {data_ref} to {safe_graph_name}. Check that "
-            f"columns {safe_x_col} and {safe_y_col} exist and contain data."
-        )
-        raise ValueError(msg)
-    settle_new_plots(safe_graph_name, expected_min_plots=prior_count + 1)
+    from ..originpro_backend import is_available as _originpro_available
+    if _originpro_available():
+        from ..originpro_backend import add_xy_plot
+        add_xy_plot(safe_graph_name, safe_book, safe_sheet, safe_x_col,
+                    safe_y_col, safe_plot_type, y_error_col=y_error_col)
+    else:
+        if not execute_labtalk(f"plotxy iy:={data_ref} plot:={ptype} ogl:=[{safe_graph_name}]Layer1;"):
+            msg = (
+                f"Could not add plot {data_ref} to {safe_graph_name}. Check that "
+                f"columns {safe_x_col} and {safe_y_col} exist and contain data."
+            )
+            raise ValueError(msg)
+    settle_new_plots(safe_graph_name, expected_min_plots=prior_count + (2 if y_error_col else 1))
     return f"Added {safe_plot_type} plot to {safe_graph_name}"
 
 @mcp.tool()
@@ -339,25 +373,16 @@ def delete_graph(graph_name: str) -> str:
 
 @mcp.tool()
 def remove_plot(graph_name: str, plot_index: int = 1) -> str:
-    """Remove a single data plot from a graph's first layer.
+    """Remove ONE data plot from the first layer, leaving the others.
 
-    Use this to delete a stray/duplicate/dead-guide curve without touching the
-    others. Removes ONLY the plot at `plot_index` via the COM DataPlot's
-    `Destroy()` — so when the SAME dataset is plotted more than once, only the
-    indexed copy goes (the LabTalk `layer -e <dataset>` route removed EVERY plot
-    of that dataset, since it addresses by dataset NAME, not by plot; verified).
-    `Destroy()` is the only working per-index route on this build — the DataPlot
-    COM object has no `Remove`/`Delete`, and `range r; delete r` reports success
-    but leaves the plot on the layer.
+    Deletes only the plot at `plot_index` (LabTalk `layer -e <dataset>` would
+    remove every plot of that dataset). For a stray or dead-guide curve.
 
     Args:
-        graph_name: Graph name
-        plot_index: 1-based index over the graph's DATA plots (same numbering
-                    as set_plot_style; error-bar plots are not counted)
-
-    Returns:
-        Confirmation message naming the removed plot and the survivors.
-    """
+        graph_name: graph.
+        plot_index: 1-based index over DATA plots (same numbering as
+            set_plot_style; error-bar plots not counted).
+    Returns a confirmation naming the removed plot and the survivors."""
     from .style_helpers import acquire_graph_layer, get_plot_info
 
     safe_graph = labtalk_name(graph_name, "graph_name")
@@ -410,31 +435,21 @@ def set_error_bars(
     err_col: int,
     direction: str = "y",
 ) -> str:
-    """Attach error bars to an EXISTING plot from an error column, in place.
+    """Attach error bars from an error column to an EXISTING plotted Y, in place
+    (no stray curve, no extra legend entry).
 
-    Uses Origin's `set <err> -o <y>` idiom: the error column is plotted into the
-    layer, SETTLED (the missing settle after this plotxy is what silently broke
-    the attach — the reassignment and the column-type designation raced the new
-    plot and no-op'd), reassigned as error bars of the target Y plot, then
-    designated as an error column and the legend rebuilt — so no stray curve or
-    extra legend entry is left behind. The attach is VERIFIED by reading the
-    error column's designation back (and, for Y, confirming no extra data curve
-    survived); on failure the stray curve is removed and the tool raises instead
-    of reporting a false success. The error and Y columns must live in the same
-    sheet, and the target Y column must already be plotted on the graph.
+    The Y and error columns must be in the same sheet and the Y column must
+    already be plotted. The attach is VERIFIED by reading the designation
+    back; on failure the stray curve is removed and the tool raises instead of
+    reporting a false success.
 
     Args:
-        graph_name: Graph that already shows the Y plot
-        data_book: Workbook holding both the Y and error columns
-        data_sheet: Sheet holding both columns
-        y_col: 1-based column of the plotted Y data to decorate
-        err_col: 1-based column holding the error values (SD/SE)
-        direction: "y" for Y error bars (default) or "x" for X error bars
-
-    Returns:
-        Success message. Raises ValueError (after removing the stray curve) if
-        the error column did not convert to error bars.
-    """
+        graph_name: graph that already shows the Y plot.
+        data_book, data_sheet: workbook and sheet holding both columns.
+        y_col: 1-based column of the plotted Y data to decorate.
+        err_col: 1-based column of the error values (SD/SE).
+        direction: "y" (default) or "x" error bars.
+    Returns a success message, or ValueError if the column did not convert."""
     safe_graph = labtalk_name(graph_name, "graph_name")
     safe_book = labtalk_name(data_book, "data_book")
     safe_sheet = labtalk_name(data_sheet, "data_sheet")
@@ -530,24 +545,16 @@ def set_layer_geometry(
     width: float | None = None,
     height: float | None = None,
 ) -> str:
-    """Set a graph layer's panel geometry (position and size).
+    """Set a layer's panel position and size; only passed fields change.
 
-    Values are in the layer's current units — Origin's default is percent of
-    the page, so left=15, top=12, width=75, height=75 places a single panel
-    with even margins. Use this to stop axis titles from being clipped outside
-    the frame or to line up multi-panel figures. Only the provided fields are
-    changed. Operates on the graph's first layer.
+    Values use the layer's current units; Origin's default is percent of the
+    page, so left=15, top=12, width=75, height=75 gives even margins. Stops
+    axis titles being clipped; aligns multi-panel figures.
 
     Args:
-        graph_name: Graph name
-        left: Panel left edge (None = leave)
-        top: Panel top edge (None = leave)
-        width: Panel width (None = leave)
-        height: Panel height (None = leave)
-
-    Returns:
-        Success message
-    """
+        graph_name: graph. left: left edge. top: top edge. width: width.
+        height: height (all None = leave unchanged).
+    Returns a success message."""
     safe_graph = labtalk_name(graph_name, "graph_name")
     require_graph(safe_graph)
     fields = {"left": left, "top": top, "width": width, "height": height}
@@ -598,11 +605,15 @@ def _set_axis_labels_impl(
     safe_graph_name = labtalk_name(graph_name, "graph_name")
     activate_window(safe_graph_name, "graph_name")
     if x_label:
-        if not execute_labtalk(f"xb.text$ = {labtalk_text(x_label, 'x_label')};"):
+        from ..labtalk_safe import default_axis_title
+        safe_text = labtalk_text(default_axis_title(x_label), 'x_label')
+        if not execute_labtalk(f'xb.text$ = {safe_text}; xb.font$ = "Times New Roman";'):
             msg = f"Could not set the x-axis label on {safe_graph_name}."
             raise ValueError(msg)
     if y_label:
-        if not execute_labtalk(f"yl.text$ = {labtalk_text(y_label, 'y_label')};"):
+        from ..labtalk_safe import default_axis_title
+        safe_text = labtalk_text(default_axis_title(y_label), 'y_label')
+        if not execute_labtalk(f'yl.text$ = {safe_text}; yl.font$ = "Times New Roman";'):
             msg = f"Could not set the y-axis label on {safe_graph_name}."
             raise ValueError(msg)
     if title:
@@ -838,30 +849,17 @@ def add_second_y_axis(
     plot_type: str = "line+symbol",
     color: str = "",
 ) -> str:
-    """Add a right-side Y axis layer and plot a second dataset on it.
+    """Add a right-side Y-axis layer and plot a second dataset on it.
 
     Args:
-        graph_name: Existing graph
-        data_book, data_sheet: Source data
-        x_col, y_col: Columns for the right-axis series (1-based)
-        plot_type: scatter, line, line+symbol, column, bar, area
-        color: Optional "r,g,b" (each 0-255) — always this comma-separated
-            numeric form, unlike `set_plot_style`'s `color` (named, e.g.
-            "blue") vs. its separate `rgb` param. When given, the RIGHT axis
-            LINE (with its ticks) and the RIGHT tick-number LABELS are
-            colored to match — the dual-Y "right axis colored like its data"
-            convention. Leave empty to keep them black.
-
-    Returns:
-        Success message
-
-    The visible right axis is layer 2's ``y2`` (positional right) — NOT its
-    ``y``, which is a hidden LEFT axis and a silent-no-op trap. `color` above
-    sets the axis line + tick labels only; the right-axis TITLE is a separate
-    ``YR`` text object this tool does not touch. Full recipe (title text/
-    color/size, why ``layer.y.*``/``yl`` are traps here):
-    `get_skill('labtalk-gotchas')`.
-    """
+        graph_name: existing graph. data_book, data_sheet: source.
+        x_col, y_col: right-axis series columns (1-based).
+        plot_type: scatter, line, line+symbol, column, bar, area.
+        color: optional "r,g,b" (0-255 each), numeric, never a name; colors
+            the RIGHT axis line and ticks; "" = black.
+    Right axis is layer 2's `y2` (positional right), NOT its `y` (hidden left
+    axis; `layer.y.*`/`yl` are no-ops); does not touch the TITLE.
+    Returns success. Details: get_skill('labtalk-gotchas')."""
     safe_graph = labtalk_name(graph_name, "graph_name")
     safe_book = labtalk_name(data_book, "data_book")
     safe_sheet = labtalk_name(data_sheet, "data_sheet")
@@ -1002,7 +1000,8 @@ def _add_text_annotation_impl(
     require_graph(safe_graph)
     activate_window(safe_graph, "graph_name")
     execute_labtalk("layer1;")
-    if not execute_labtalk(f"label -p {float(x)} {float(y)} -n {safe_name} {text};"):
+    # -p means percent of the layer frame; -a uses Cartesian data values.
+    if not execute_labtalk(f"label -a {float(x)} {float(y)} -n {safe_name} {text};"):
         msg = f"Could not add the annotation to {safe_graph}."
         raise ValueError(msg)
     return f"Added annotation '{text}' at ({x}, {y}) on {safe_graph}"
@@ -1050,9 +1049,14 @@ def _export_via_expgraph(
         f'expGraph type:={safe_format} path:="{out_dir}" filename:="{fname}" '
         f"overwrite:=replace{size_opts};"
     )
-    if not execute_labtalk(cmd):
-        msg = f"Origin could not export {safe_graph} to {path}."
-        raise ValueError(msg)
+    from ..originpro_backend import is_available as _originpro_available
+    if _originpro_available():
+        from ..originpro_backend import export_graph as _originpro_export_graph
+        _originpro_export_graph(safe_graph, path, safe_format, width if safe_format in EXPORT_RASTER_FORMATS else 0)
+    else:
+        if not execute_labtalk(cmd):
+            msg = f"Origin could not export {safe_graph} to {path}."
+            raise ValueError(msg)
     if not os.path.exists(path):
         hint = ""
         if path.startswith("/"):
@@ -1062,6 +1066,8 @@ def _export_via_expgraph(
             )
         msg = f"Export failed: {path} was not created.{hint}"
         raise ValueError(msg)
+    if os.path.getsize(path) == 0:
+        raise ValueError(f"Export produced an empty file: {path}. Inspect Origin and the destination before retrying.")
     return path
 
 
@@ -1404,51 +1410,20 @@ def axis(
     """Configure a graph's axes.
 
     Args:
-        graph_name: Graph name.
-        op: Which axis aspect to set:
-            - "labels": set an axis label. Uses `axis` ("x", "y", "both",
-              "right", or "top") and `label` (the text). "right" sets the
-              dual-Y right-axis title (requires a second Y layer from
-              add_second_y_axis — raises otherwise, never a false success);
-              "top" sets the top-axis title. Note: does not set the graph
-              title.
-            - "range": set an axis range. Uses `axis` plus `range_min`/
-              `range_max` (None = auto). With axis="both" the same range is
-              applied to X and Y.
-            - "scale": set an axis scale. Uses `axis` ("x" or "y") and `scale`
-              (linear, log10, ln, log2). By default the axis range is reset to
-              the data extent after the change (pass rescale=False to keep the
-              current range); range bounds are ACTUAL values, not exponents.
-            - "tick": set tick-mark style. Uses `axis` ("x", "y", "both",
-              "top", or "right" — "top"/"right" target ONLY the opposite-side
-              border axis (x2/y2), e.g. to strip its tick marks without
-              touching the bottom/left axis), `tick_direction` (in/out/both/
-              none, default in — "none" removes that side's tick MARKS when
-              present while always leaving its number labels alone (a default
-              closed frame may show few/no opposite-side marks, so the visible
-              change can be subtle); NEVER emits `majorTicks`, which
-              probe-confirmed wipes ALL axes' number labels), plus
-              `major_length` (default 8), `minor_count` (default 4),
-              `show_minor` (default True).
-            - "frame": close/open the frame (top+right border axes) and/or
-              set the frame LINE width. Uses `frame` ("closed" or "open",
-              default "closed") and `frame_width` (points, applied to all 4
-              sides; None = leave unchanged).
-        axis: Target axis ("x", "y", "both", "top", or "right"; default "both").
-            For op="labels", "right"/"top" set the right/top-axis TITLE.
-        label: Axis label text (op="labels").
-        range_min, range_max: Axis range bounds (op="range").
-        scale: Axis scale type (op="scale").
-        tick_direction, major_length, minor_count, show_minor: Tick style
-            (op="tick").
-        rescale: For op="scale", auto-rescale to the data extent (default True).
-        frame: For op="frame", "closed" or "open" (default "closed").
-        frame_width: For op="frame", frame line width in points (None = leave
-            unchanged).
-
-    Returns:
-        Success message for the selected operation.
-    """
+        graph_name: graph. op: labels/range/scale/tick/frame.
+        axis: x, y, both (default) or top/right (opposite border axes; for
+            labels they set that TITLE). label: axis text (op=labels; not the
+            title).
+        range_min, range_max: bounds (op=range; None=auto; axis=both sets Y
+            too). ACTUAL values, not exponents.
+        scale: linear, log10, ln, log2 (op=scale, x/y).
+        tick_direction, major_length, minor_count, show_minor: tick style
+            (op=tick; defaults in, 8, 4, True); "none" drops marks, not
+            numbers.
+        rescale: op=scale, reset to data (default True). frame: closed
+            (default) or open. frame_width: POINTS, 4 sides.
+    op=labels+axis=right needs add_second_y_axis (else raises); never writes
+    `majorTicks` (wipes labels). Returns success."""
     safe_op = labtalk_choice(op.lower(), _AXIS_OPS, "op")
     if safe_op == "labels":
         if label is None:
@@ -1532,30 +1507,19 @@ def annotate(
     head_size: int = 10,
     name: str = "anno",
 ) -> str:
-    """Add an annotation object to a graph.
+    """Add one annotation object to a graph, in DATA coordinates.
 
     Args:
-        graph_name: Graph name.
-        kind: Which annotation to add:
-            - "reference_line": horizontal/vertical line. Uses `orientation`
-              ("horizontal"/"vertical") and `value` (axis value).
-            - "text": text label. Uses `text` and position `x1`/`y1` (data
-              coordinates) and `name` (object name).
-            - "line": straight line from (x1,y1) to (x2,y2).
-            - "arrow": arrow from (x1,y1) to (x2,y2). Uses `double_headed`
-              and `head_size`.
-        x1, y1: Start/position in data coordinates.
-        x2, y2: End point in data coordinates (line/arrow).
-        value: Axis value (kind="reference_line").
-        text: Annotation text (kind="text").
-        orientation: "horizontal" or "vertical" (kind="reference_line").
-        double_headed: Arrowhead on both ends (kind="arrow").
-        head_size: Arrowhead size in points (kind="arrow").
-        name: Object name (kind="text").
-
-    Returns:
-        Success message for the selected annotation.
-    """
+        graph_name: graph.
+        kind: "reference_line" (line at `value`), "text" (label at x1/y1),
+            "line"/"arrow" (x1,y1 -> x2,y2).
+        x1, y1: start, data coords; x2, y2: end point.
+        value: axis value (reference_line). text: label text (text).
+        orientation: horizontal or vertical (reference_line).
+        double_headed: arrowheads both ends (arrow, default False); head_size:
+            points (arrow, default 10); name: object name (text, default
+            "anno").
+    Returns success."""
     safe_kind = labtalk_choice(kind.lower(), _ANNOTATE_KINDS, "kind")
     if safe_kind == "reference_line":
         if orientation is None or value is None:
@@ -1590,34 +1554,21 @@ def colormap(
     z_max: float | None = None,
     levels: int | None = None,
 ) -> str:
-    """Configure the color map of a contour/heatmap/surface graph.
-
-    Applies a palette when `palette` is given, sets the Z color-scale range when
-    both `z_min` and `z_max` are given, and/or raises the number of color levels
-    when `levels` is given. At least one of those must be supplied.
+    """Configure the color map of a contour/heatmap/surface graph. Supply at
+    least one of palette, z_min+z_max, or levels.
 
     Args:
-        graph_name: Graph name (must hold a colormapped plot).
-        palette: Palette name (e.g. Viridis, Cividis, Plasma, Fire). Bundled
-            perceptually-uniform, colorblind-safe maps are preferred for
-            quantitative data; Origin built-in .pal names are also accepted.
-            (This DOES recolor the map — do not be misled if an exported PNG's
-            byte size is unchanged; the pixels change.) An unknown palette name
-            is REJECTED up front: Origin's load() reports success for a
-            nonexistent palette, so a typo would otherwise silently do nothing.
-        z_min, z_max: Z range for the color scale (both required together). The
-            applied range is read back (layer.cmap.zmin/zmax) and raises if it
-            did not take (e.g. the graph is not a colormapped plot).
-        levels: Number of color levels (>= 2). Origin's colormap is inherently
-            banded; a default heatmap shows ~8 bands. Set ~32-64 to make it read
-            as a continuous (smooth) map. Verified read-back
-            (`layer.cmap.numColors`); raises if it did not take. Implemented via
-            `numMajorLevels` + `setLevels(1)` + `updateScale()` — the no-arg
-            `setLevels()` after `numColors=` is a silent no-op on this build.
-
-    Returns:
-        Success message describing what was changed.
-    """
+        graph_name: graph (must hold a colormapped plot).
+        palette: bundled perceptually-uniform, colorblind-safe maps (Viridis,
+            Cividis, Plasma, Fire) are preferred for quantitative data; Origin
+            .pal names also work. It DOES recolor the map: an unchanged PNG
+            byte size does not mean failure. An unknown name is REJECTED up
+            front, so a typo cannot silently do nothing.
+        z_min, z_max: Z range of the color scale (both together); read back and
+            raises if it did not take.
+        levels: color levels (>=2). Origin's map is inherently banded (~8 by
+            default); use ~32-64 to read as continuous; numerically read back.
+    Returns a success message describing what changed."""
     if palette is None and z_min is None and z_max is None and levels is None:
         msg = "colormap requires palette, z_min+z_max, and/or levels."
         raise ValueError(msg)
@@ -1642,30 +1593,17 @@ def export_graph(
     width: int = 0,
     sized: bool = False,
 ) -> str:
-    """Export a graph to an image file.
-
-    Export never touches the Windows clipboard: the file is written directly
-    via Origin's expGraph X-Function, so the user's clipboard is preserved.
+    """Export one graph to an image file; never touches the Windows clipboard.
 
     Args:
-        graph_name: Graph to export.
-        file_path: Output path (Windows or WSL style). Missing directories
-            are created.
-        format: Output format. Raster: png, jpg, tif, bmp. Vector (journal
-            submission): pdf, eps, emf. Vector formats are resolution-
-            independent and ignore width.
-        width: Output raster pixel WIDTH. 0 (default) = auto ~1200px wide. Any
-            value > 0 is applied — no sized=True needed. The HEIGHT always
-            follows the graph's aspect ratio (Origin's expGraph cannot set an
-            independent pixel height on this build), so there is no height
-            parameter.
-        sized: Kept for compatibility. When True, force the sized export even
-            with the default width (~1200px wide). Redundant now that an
-            explicit width is always honored.
-
-    Returns:
-        Path to the exported file.
-    """
+        graph_name: graph to export.
+        file_path: output path (Windows or WSL style); missing dirs created.
+        format: png, jpg, tif, bmp (raster) or pdf, eps, emf (vector, for
+            journal submission; ignores width).
+        width: raster pixel WIDTH; 0 (default) = auto ~1200, else applied;
+            HEIGHT follows the graph's aspect ratio (no height param).
+        sized: compatibility flag; True forces sized export at default width.
+    Returns the path to the exported file."""
     if sized or width > 0:
         return _export_graph_sized_impl(
             graph_name, file_path, width=width or 1200, format=format

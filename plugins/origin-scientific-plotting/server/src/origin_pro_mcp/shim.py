@@ -19,8 +19,10 @@ A background heartbeat timer pings the daemon every ``heartbeat_interval``
 seconds over the same connection, using the connection's send-lock so it never
 corrupts an in-flight request frame.
 
-CUTOVER IS OFF in this phase: ``app.main`` still runs the in-process server by
-default. The shim is reached only when ``ORIGIN_PRO_MCP_USE_DAEMON`` is truthy.
+The daemon-backed shim is the DEFAULT entrypoint (``app.USE_DAEMON_DEFAULT``);
+set ``ORIGIN_PRO_MCP_USE_DAEMON=0`` to run the legacy in-process server. The shim
+and the daemon exchange a code identity (``identify`` frame + hello metadata) so
+a version mismatch is reported instead of silently running stale code.
 """
 from __future__ import annotations
 
@@ -37,7 +39,11 @@ from typing import Optional, Tuple
 
 from mcp.server.fastmcp import FastMCP
 
+from . import runlog
 from . import transport
+from .build_version import (
+    CODE_VERSION, IDENTITY_PROTOCOL, PING_PROTOCOL, compare_versions,
+)
 from .daemon import (
     DISPATCH_KILL_GRACE_DEFAULT,
     DISPATCH_TIMEOUT_DEFAULT,
@@ -48,6 +54,54 @@ from .daemon import (
 from .transport import FrameError
 
 HOST = "127.0.0.1"
+
+# Tools that cannot change Origin project data or user state. Used ONLY when the
+# daemon's code version is unverified: read-only inspection stays available while
+# everything else is refused until the clients restart onto one code version.
+# Anything not listed is treated as side-effecting (fail closed).
+READ_ONLY_TOOLS = frozenset({
+    "get_labtalk_variable",
+    "get_worksheet_data",
+    "list_worksheets",
+    "list_fitting_functions",
+    "get_matrix_data",
+    "preview_excel_range",
+    "inspect_graph_basic",
+    "inspect_graph_layers",
+    "graph_property_snapshot",
+    "graph_quality_basic",
+    "diagnose_origin_runtime",
+    "worksheet_slice",
+    "prepare_spectrum_peaks",
+    "read_workflow_template",
+    "list_skills",
+    "get_skill",
+})
+
+
+class _StaleConnection(Exception):
+    """The cached daemon link failed its pre-send liveness probe.
+
+    Raised ONLY before any business-request byte is written, so the caller may
+    safely discard the link and retry once on a fresh connection.
+    """
+
+
+def resolve_lockfile_path(explicit: Optional[str] = None) -> str:
+    """Resolve the daemon discovery lockfile consistently for every process.
+
+    Precedence: explicit argument > non-empty ``ORIGIN_PRO_MCP_LOCKFILE`` >
+    the unified default. The shim, the spawned daemon and the launcher must all
+    agree, otherwise two stacks silently believe they share a daemon (or
+    silently don't).
+    """
+    candidate = explicit
+    if not candidate:
+        candidate = os.environ.get("ORIGIN_PRO_MCP_LOCKFILE")
+    candidate = (candidate or "").strip()
+    if not candidate:
+        return default_lockfile_path()
+    return os.path.abspath(os.path.expanduser(candidate))
 
 
 # --------------------------------------------------------------------------- #
@@ -126,9 +180,16 @@ def _spawn_daemon(lockfile_path: str,
     else:
         kwargs["start_new_session"] = True
 
-    subprocess.Popen(
-        [sys.executable, "-m", "origin_pro_mcp.daemon"], **kwargs
-    )
+    command = [sys.executable, "-m", "origin_pro_mcp.daemon"]
+    try:
+        proc = subprocess.Popen(command, **kwargs)
+    except OSError as exc:
+        # The parent records what it can observe; the daemon cannot log a spawn
+        # that never happened.
+        runlog.status(lockfile_path, "spawn_error",
+                      error_type=runlog.error_type(exc))
+        raise
+    runlog.status(lockfile_path, "spawn_ok", pid=proc.pid)
 
 
 def ensure_daemon(lockfile_path: Optional[str] = None, *,
@@ -178,6 +239,7 @@ def ensure_daemon(lockfile_path: Optional[str] = None, *,
         time.sleep(interval)
         interval = min(interval * 1.5, max_poll_interval)
 
+    runlog.status(lockfile_path, "spawn_timeout", reason="not_connectable")
     raise RuntimeError(
         f"Timed out after {spawn_timeout:.0f}s waiting for the Origin daemon "
         f"to come up (lockfile: {lockfile_path}). Verify that "
@@ -243,7 +305,7 @@ class ShimClient:
                  call_timeout: float = 60.0,
                  allow_spawn: bool = True,
                  ensure_kwargs: Optional[dict] = None):
-        self._lockfile_path = lockfile_path
+        self._lockfile_path = resolve_lockfile_path(lockfile_path)
         self._session_id = session_id or uuid.uuid4().hex
         self._heartbeat_interval = heartbeat_interval
         self._call_timeout = _reconcile_call_timeout(call_timeout)
@@ -254,11 +316,20 @@ class ShimClient:
         self._attach = _at is not None and _at.strip().lower() in (
             "1", "on", "true", "yes")
         self._ensure_kwargs = dict(ensure_kwargs or {})
+        self._target_origin = None
+        self._ever_forwarded = False
+        self._released = False
+        self._selection_lock = threading.RLock()
         self._conn = None
         self._conn_lock = threading.Lock()   # guards connection lifecycle
         self._call_lock = threading.Lock()   # serializes send+recv per call
         self._hb_thread: Optional[threading.Thread] = None
         self._hb_stop: Optional[threading.Event] = None
+        # Daemon identity observed on connect (handshake, else lockfile hint).
+        self._daemon_identity: Optional[dict] = None
+        self._daemon_identity_protocol: Optional[int] = None
+        self._version_issue: Optional[str] = None
+        self._version_notice_sent = False
 
     @property
     def session_id(self) -> str:
@@ -274,8 +345,15 @@ class ShimClient:
                 self._lockfile_path, spawn=self._allow_spawn,
                 **self._ensure_kwargs,
             )
-            conn = transport.connect(host, port, token,
-                                     session_id=self._session_id)
+            conn = transport.connect(
+                host, port, token, session_id=self._session_id,
+                metadata={"code_version": CODE_VERSION,
+                          "identity_protocol": IDENTITY_PROTOCOL},
+            )
+            # Identity probe BEFORE the heartbeat starts: a daemon that does
+            # not support it (older build) times out once and we fall back to
+            # the lockfile hint. Never fatal — a mismatch only warns.
+            self._record_daemon_identity(self._query_identity(conn))
             conn.settimeout(self._call_timeout)
             self._conn = conn
             self._start_heartbeat(conn)
@@ -317,50 +395,243 @@ class ShimClient:
         self._hb_stop = None
         self._hb_thread = None
 
-    # -- the forward path ---------------------------------------------------- #
+    # -- daemon identity (version-mismatch detection) ------------------------ #
 
-    def call(self, name: str, kwargs: dict):
-        """Forward one tool call; reconnect exactly once on a dropped link."""
-        conn = self._ensure_conn()
+    def _query_identity(self, conn) -> Optional[dict]:
+        """Ask the daemon for its code identity; None when the peer is older.
+
+        The probe is bounded by a short timeout so connecting to a daemon that
+        predates the identity protocol costs at most a couple of seconds once.
+        """
         try:
-            return self._exchange(conn, name, kwargs)
-        except (OSError, FrameError) as exc:
-            self._reset_conn()
-            raise RuntimeError(
-                f"Connection lost during {name!r}: its outcome is unknown. "
-                "The request was NOT replayed because it may already have changed "
-                "Origin. Inspect the session before retrying. "
-                f"Transport error: {exc}"
-            ) from exc
-
-    def _exchange(self, conn, name: str, kwargs: dict):
-        request_id = uuid.uuid4().hex
-        with self._call_lock:
-            conn.send_frame({
-                "type": "request",
-                "request_id": request_id,
-                "session_id": self._session_id,
-                "name": name,
-                "kwargs": kwargs or {},
-                "attach": self._attach,
-            })
+            conn.settimeout(2.0)
+            conn.send_frame({"type": "identify"})
             while True:
                 frame = conn.recv_frame()
                 if frame is None:
-                    raise FrameError("daemon closed the connection mid-call")
-                if frame.get("type") != "response":
-                    continue  # skip stray non-response frames (defensive)
-                if frame.get("request_id") != request_id:
-                    continue  # not our response — keep reading
-                break
+                    return None
+                if frame.get("type") == "identity":
+                    return frame
+        except (OSError, FrameError):
+            return None
+        finally:
+            try:
+                conn.settimeout(self._call_timeout)
+            except OSError:
+                pass
+
+    def _record_daemon_identity(self, identity: Optional[dict]) -> None:
+        """Compare the daemon's code version with ours.
+
+        The authenticated handshake is authoritative; when it is unavailable
+        (older daemon) the lockfile's ``code_version`` is used only as a hint.
+        A missing value stays ``unknown`` — never a match, never a replacement.
+        """
+        remote = identity.get("code_version") if isinstance(identity, dict) else None
+        protocol = identity.get("identity_protocol") if isinstance(identity, dict) else None
+        source = "handshake" if isinstance(remote, str) and remote else "lockfile"
+        if source == "lockfile":
+            try:
+                data = read_lockfile(self._lockfile_path)
+                remote = data.get("code_version") if isinstance(data, dict) else None
+            except (OSError, ValueError):
+                remote = None
+        if not isinstance(remote, str) or not remote:
+            source = "unknown"
+        comparison = compare_versions(CODE_VERSION, remote,
+                                      remote_source=source)
+        self._daemon_identity_protocol = (protocol if isinstance(protocol, int)
+                                          else None)
+        self._daemon_identity = {
+            "code_version": remote if source != "unknown" else None,
+            "source": source,
+            "status": comparison["status"],
+            "identity_protocol": self._daemon_identity_protocol,
+            "daemon_pid": identity.get("daemon_pid") if isinstance(identity, dict) else None,
+            "generation": identity.get("generation") if isinstance(identity, dict) else None,
+        }
+        self._version_issue = (None if comparison["status"] == "match"
+                               else comparison["message"])
+
+    def _supports_ping(self) -> bool:
+        """True when the daemon advertised the ping capability (protocol >= 2)."""
+        protocol = self._daemon_identity_protocol
+        return bool(protocol and protocol >= PING_PROTOCOL)
+
+    def _ping_locked(self, conn) -> bool:
+        """Authenticated liveness probe on the cached connection.
+
+        Must run INSIDE ``_call_lock`` and BEFORE any business-request byte is
+        sent: a false result therefore PROVES the request never started, while
+        an exception during the request send cannot prove that and is never
+        replayed. Bounded by a short timeout; never breaks the call budget.
+        """
+        saved = self._call_timeout
+        try:
+            conn.settimeout(min(3.0, max(0.5, self._call_timeout)))
+            conn.send_frame({"type": "ping", "ts": time.time()})
+            while True:
+                frame = conn.recv_frame()
+                if frame is None:
+                    return False
+                if frame.get("type") == "pong":
+                    return True
+        except (OSError, FrameError):
+            return False
+        finally:
+            try:
+                conn.settimeout(saved)
+            except OSError:
+                pass
+
+    @property
+    def daemon_identity(self) -> Optional[dict]:
+        return self._daemon_identity
+
+    # -- the forward path ---------------------------------------------------- #
+
+    def call(self, name: str, kwargs: dict):
+        with self._selection_lock:
+            if self._released:
+                raise RuntimeError('Origin session was released. Start a new chat to connect again; no new Origin was opened.')
+            self._ever_forwarded = True
+            return self._call_selected(name, kwargs)
+
+    def release_origin_session(self):
+        """Release this client's saved, owned Origin session."""
+        with self._selection_lock:
+            if self._released:
+                return '{"released":true,"already_released":true,"origin_launched":false}'
+            if not self._ever_forwarded:
+                self._released = True
+                return '{"released":true,"no_active_session":true,"origin_launched":false}'
+            if self._conn is None:
+                raise RuntimeError('Connection is unavailable; release status is unknown. No new Origin was started.')
+            try:
+                result = self._call_selected('__release_origin_session', {})
+            except RuntimeError as exc:
+                if str(exc).startswith("Connection lost during '__release_origin_session'"):
+                    # The release may already have happened: never silently
+                    # create another Origin on a later call in this session.
+                    self._released = True
+                    self._reset_conn()
+                raise
+            self._released = True
+            self._reset_conn()
+            return result
+
+    def bind_existing(self, pid: int):
+        """Choose a target before forwarding any Origin request."""
+        from .existing_origin import require_window
+        with self._selection_lock:
+            if self._ever_forwarded:
+                raise RuntimeError("An Origin session is already in use. Start a new chat before selecting an existing window; the current project was left open.")
+            target = require_window(pid)
+            self._attach = True
+            self._target_origin = {'pid': target['pid'], 'creation_filetime': target['creation_filetime']}
+            result = self.call('diagnose_origin_runtime', {})
+            return {'target': target, 'verified': True, 'diagnostic': result,
+                    'before_edit': 'Call save_project successfully before modifying this Origin project.'}
+
+    def _call_selected(self, name: str, kwargs: dict):
+        """Forward one tool call.
+
+        A cached link that fails its pre-send liveness probe (nothing was sent)
+        is dropped and the call is retried exactly once on a fresh connection
+        (re-handshake + version check). A failure AFTER the request frame was
+        written is never replayed — its outcome is unknown.
+        """
+        for attempt in (1, 2):
+            conn = self._ensure_conn()
+            try:
+                return self._exchange(conn, name, kwargs)
+            except _StaleConnection as exc:
+                self._reset_conn()
+                if attempt == 1:
+                    continue  # provably nothing was sent -> safe retry once
+                raise RuntimeError(
+                    "The daemon connection was stale and could not be restored; "
+                    f"{name!r} was NOT sent. Check the daemon and retry. "
+                    f"Transport error: {exc}"
+                ) from exc
+            except (OSError, FrameError) as exc:
+                self._reset_conn()
+                raise RuntimeError(
+                    f"Connection lost during {name!r}: its outcome is unknown. "
+                    "The request was NOT replayed because it may already have "
+                    "changed Origin. Inspect the session before retrying. "
+                    f"Transport error: {exc}"
+                ) from exc
+
+    def _exchange(self, conn, name: str, kwargs: dict):
+        request_id = uuid.uuid4().hex
+        status = ((self._daemon_identity or {}).get("status")
+                  if self._daemon_identity else "unknown")
+        if self._version_issue and name not in READ_ONLY_TOOLS:
+            # Fail closed BEFORE any byte is sent: an unverified daemon must not
+            # execute a possibly side-effecting tool under unknown compatibility.
+            raise RuntimeError(
+                f"Refusing {name!r}: the daemon's code version is unverified "
+                f"({status}). Only read-only inspection is allowed until the "
+                "clients are restarted onto one code version. Save/close your "
+                "Origin work, restart this MCP client (and the other connected "
+                f"client), then retry. Details: {self._version_issue}"
+            )
+        # run_labtalk can carry an explicit per-call budget. Widen the socket
+        # read timeout to match it (plus transport margin) so a long-but-valid
+        # script is not reported as "connection lost" before its reply arrives.
+        call_timeout = self._call_timeout
+        override = (kwargs or {}).get("timeout") if name == "run_labtalk" else None
+        if (isinstance(override, (int, float)) and not isinstance(override, bool)
+                and override > 0):
+            call_timeout = max(self._call_timeout, float(override) + 30.0)
+        with self._call_lock:
+            # Pre-send liveness probe (nothing sent yet -> retry is provably safe).
+            if self._supports_ping() and not self._ping_locked(conn):
+                raise _StaleConnection("liveness probe failed before send")
+            conn.settimeout(call_timeout)
+            try:
+                conn.send_frame({
+                    "type": "request",
+                    "request_id": request_id,
+                    "session_id": self._session_id,
+                    "name": name,
+                    "kwargs": kwargs or {},
+                    "attach": self._attach,
+                    "target_origin": self._target_origin,
+                })
+                while True:
+                    frame = conn.recv_frame()
+                    if frame is None:
+                        raise FrameError("daemon closed the connection mid-call")
+                    if frame.get("type") != "response":
+                        continue  # skip stray non-response frames (defensive)
+                    if frame.get("request_id") != request_id:
+                        continue  # not our response — keep reading
+                    break
+            finally:
+                try:
+                    conn.settimeout(self._call_timeout)
+                except OSError:
+                    pass
         if frame.get("ok"):
             result = frame.get("result")
+            notices = []
             # One-shot lifecycle notice the daemon may piggyback on the first
             # successful response of a session (restart/ghost/attach context).
             notice = frame.get("notice")
             if notice:
+                notices.append(str(notice))
+            # One-shot code-version warning: the agent AND the transcript see it.
+            # "Note:" keeps the text compatible with clients/tools that expect
+            # the daemon's "[origin-mcp] Note:" trailer format.
+            if self._version_issue and not self._version_notice_sent:
+                self._version_notice_sent = True
+                notices.append(f"Note: {self._version_issue}")
+            if notices:
                 base = result if result is not None else ""
-                return f"{base}\n\n[origin-mcp] {notice}"
+                prefixed = "\n".join(f"[origin-mcp] {text}" for text in notices)
+                return f"{base}\n\n{prefixed}" if base else prefixed
             return result
         raise RuntimeError(frame.get("error") or "unknown daemon error")
 
@@ -371,7 +642,7 @@ class ShimClient:
 
 
 def _real_registry() -> dict:
-    """The real FastMCP tool registry — ``{name: fn}`` for all 37 tools.
+    """The real FastMCP tool registry — ``{name: fn}`` for every tool.
 
     Routes through :func:`~.daemon.iter_registered_tools` so a FastMCP internals
     change fails LOUD (RuntimeError) here rather than silently building a shim
@@ -414,12 +685,36 @@ def build_shim_server(client: ShimClient, *, name: str = "origin-pro") -> FastMC
     from .skills import SERVER_INSTRUCTIONS, SKILL_TOOL_NAMES, register_skills
 
     shim = FastMCP(name, log_level="ERROR", instructions=SERVER_INSTRUCTIONS)
+    # Advertise the plugin build (not the mcp SDK version) in serverInfo.version,
+    # so a client can tell which code version is serving it.
+    try:  # pragma: no cover - private attribute of an optional SDK version
+        shim._mcp_server.version = CODE_VERSION
+    except Exception:  # pragma: no cover
+        pass
     for tool_name, real_fn in _real_registry().items():
         if tool_name in SKILL_TOOL_NAMES:
             continue  # served locally below — never forward to the daemon
         shim.add_tool(_make_forwarder(tool_name, real_fn, client),
                       name=tool_name)
     register_skills(shim)
+
+    @shim.tool()
+    def release_origin_session() -> str:
+        """Release this MCP session after saving and normally close its verified owned Origin. Unsaved projects are refused. No Origin is started by this tool."""
+        return client.release_origin_session()
+
+    @shim.tool()
+    def list_open_origin_windows() -> str:
+        """List visible Origin windows with PID, title and process start identity, without launching Origin."""
+        from .existing_origin import list_windows
+        import json
+        return json.dumps({'windows': list_windows(), 'origin_launched': False}, ensure_ascii=False)
+
+    @shim.tool()
+    def connect_existing_origin(pid: int) -> str:
+        """Existing windows are not attached; each session owns a new Origin."""
+        raise RuntimeError('Attaching to an existing Origin is disabled. Start an isolated session and open a project copy instead.')
+
     return shim
 
 

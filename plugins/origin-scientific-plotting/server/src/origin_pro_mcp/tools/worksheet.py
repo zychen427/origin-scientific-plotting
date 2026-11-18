@@ -6,6 +6,7 @@ import os
 import re
 
 from ..app import mcp
+from ..missing import ORIGIN_MISSING, is_origin_missing
 from ..origin_connection import (
     activate_window,
     execute_labtalk,
@@ -32,25 +33,14 @@ from ..labtalk_safe import (
 
 @mcp.tool()
 def create_worksheet(book_name: str, sheet_name: str = "Sheet1") -> str:
-    """Create a worksheet in Origin: a new workbook, or a new sheet added to
-    an EXISTING workbook of the given name (never a second, auto-renamed
-    workbook — Origin's ``CreatePage`` on a taken name silently uniquifies
-    it, which used to leave callers with two books instead of one).
+    """Create a worksheet: a new workbook, or a new sheet in an EXISTING workbook
+    of that name (never a second, auto-renamed book).
 
     Args:
-        book_name: Workbook name. If a workbook by this name is already
-            open, the sheet is added to it instead of creating a new book.
-        sheet_name: Name for the sheet (default: Sheet1)
-
-    Returns:
-        JSON object: {"name": <actual workbook name>, "requested_name":
-        <book_name>, "renamed": <bool, true if Origin uniquified the name;
-        always false when added_to_existing_book is true>, "sheet": <sheet
-        name>, "added_to_existing_book": <bool>}
-
-    Raises:
-        ValueError: if book_name already has a sheet named sheet_name.
-    """
+        book_name: workbook name; if already open, the sheet is added to it.
+        sheet_name: sheet name (default "Sheet1").
+    Raises ValueError if book_name already has a sheet named sheet_name.
+    Returns {name,requested_name,renamed,sheet,added_to_existing_book}."""
     o = get_origin()
     safe_book_name = labtalk_name(book_name, "book_name")
     safe_sheet_name = labtalk_name(sheet_name, "sheet_name")
@@ -64,6 +54,18 @@ def create_worksheet(book_name: str, sheet_name: str = "Sheet1") -> str:
             )
             raise ValueError(msg)
         activate_window(safe_book_name, "book_name")
+        from ..originpro_backend import is_available as _originpro_available
+        if _originpro_available():
+            from ..originpro_backend import add_worksheet
+            name, actual_sheet = add_worksheet(safe_book_name, safe_sheet_name)
+            return json.dumps({
+                "name": name,
+                "requested_name": safe_book_name,
+                "renamed": False,
+                "sheet": actual_sheet,
+                "added_to_existing_book": True,
+                "backend": "originpro",
+            })
         if not execute_labtalk(
             f'newsheet name:={labtalk_string(safe_sheet_name, "sheet_name")} cols:=2;'
         ):
@@ -75,6 +77,19 @@ def create_worksheet(book_name: str, sheet_name: str = "Sheet1") -> str:
             "renamed": False,
             "sheet": safe_sheet_name,
             "added_to_existing_book": True,
+        })
+
+    from ..originpro_backend import is_available as _originpro_available
+    if _originpro_available():
+        from ..originpro_backend import new_worksheet
+        name, actual_sheet = new_worksheet(safe_book_name, safe_sheet_name)
+        return json.dumps({
+            "name": name,
+            "requested_name": safe_book_name,
+            "renamed": name != safe_book_name,
+            "sheet": actual_sheet,
+            "added_to_existing_book": False,
+            "backend": "originpro",
         })
 
     name = o.CreatePage(2, safe_book_name, "origin")
@@ -95,20 +110,15 @@ def set_worksheet_data(
     columns: str,
     column_names: str = ""
 ) -> str:
-    """Write data to an Origin worksheet.
+    """Write columns of data into an Origin worksheet.
 
     Args:
-        book_name: Workbook name (e.g., "Book1")
-        sheet_name: Sheet name (e.g., "Sheet1")
-        columns: JSON array of arrays, each inner array is a column of data.
-                 Example: [[1,2,3],[4,5,6]] for 2 columns with 3 rows. A cell
-                 may be JSON null (or NaN) to write an Origin missing value —
-                 rendered as a gap in the polyline, not interpolated through.
-        column_names: Optional comma-separated column names (e.g., "X,Y,Error")
-
-    Returns:
-        Success message
-    """
+        book_name: workbook name (e.g. "Book1"). sheet_name: sheet name.
+        columns: JSON array of arrays, each inner array a column, e.g.
+            [[1,2,3],[4,5,6]] = 2 columns x 3 rows. A cell may be null (or NaN)
+            for an Origin missing value: a gap, not interpolated.
+        column_names: optional comma-separated names (e.g. "X,Y,Error").
+    Returns success."""
     o = get_origin()
     safe_book_name = labtalk_name(book_name, "book_name")
     safe_sheet_name = labtalk_name(sheet_name, "sheet_name")
@@ -145,13 +155,13 @@ def set_worksheet_data(
             if isinstance(value, bool):
                 raise ValueError(f"Column {i + 1} row {r + 1} is boolean, not a numeric measurement.")
             if value is None:
-                missing_cells.append((i, r)); float_data.append(0.0); continue
+                missing_cells.append((i, r)); float_data.append(ORIGIN_MISSING); continue
             try:
                 number = float(value)
             except (TypeError, ValueError, OverflowError) as exc:
                 raise ValueError(f"Column {i + 1} row {r + 1} is not numeric; no data was written.") from exc
             if math.isnan(number):
-                missing_cells.append((i, r)); float_data.append(0.0)
+                missing_cells.append((i, r)); float_data.append(ORIGIN_MISSING)
             elif not math.isfinite(number):
                 raise ValueError(f"Column {i + 1} row {r + 1} is infinite; no data was written.")
             else:
@@ -159,6 +169,16 @@ def set_worksheet_data(
         prepared_columns.append(float_data)
     prepared_names = [labtalk_text(n.strip(), 'column_names')
                       for n in column_names.split(",")] if column_names else []
+    # originpro provides typed worksheet objects and direct column readback.
+    # Keep the COM route for Origin missing sentinels until their conversion is
+    # verified across supported Origin releases.
+    if not missing_cells:
+        from ..originpro_backend import is_available as _originpro_available
+        if _originpro_available():
+            from ..originpro_backend import write_columns
+            names = [n.strip() for n in column_names.split(",")] if column_names else []
+            write_columns(safe_book_name, safe_sheet_name, prepared_columns, names)
+            return f"Set {len(cols)} columns x {max(len(c) for c in cols)} rows in {target} (originpro; readback verified)"
     for i, float_data in enumerate(prepared_columns):
         try:
             accepted = o.PutWorksheet(target, float_data, 0, i)
@@ -168,38 +188,18 @@ def set_worksheet_data(
             raise ValueError(f"Origin rejected column {i + 1} of {target}; earlier columns may already have changed. Inspect the worksheet.")
 
     if missing_cells:
-        # The bulk PutWorksheet above already wrote a numeric 0.0 placeholder
-        # into every null/NaN cell. Each must be overwritten with Origin's real
-        # missing-value sentinel (col(c)[r]=0/0). If activation or ANY per-cell
-        # write fails, that cell silently keeps the 0.0 — a wrong number wearing
-        # a success message, the worst class of bug — so check every return and
-        # raise, naming exactly which cells still hold the placeholder.
-        def _cells(pairs):
-            return ", ".join(f"col {c + 1} row {r + 1}" for c, r in pairs)
-
-        activate_window(safe_book_name, "book_name")
-        if not execute_labtalk(
-            f'page.active$ = {labtalk_string(safe_sheet_name, "sheet_name")};'
-        ):
-            msg = (
-                f"Could not activate sheet '{safe_sheet_name}' of "
-                f"'{safe_book_name}' to write missing values. The bulk write left "
-                f"a numeric 0.0 placeholder in these cells that should be blank: "
-                f"{_cells(missing_cells)}. Treat that data as wrong."
-            )
-            raise ValueError(msg)
-        failed = []
-        for col_idx, row_idx in missing_cells:
-            if not execute_labtalk(f"col({col_idx + 1})[{row_idx + 1}]=0/0;"):
-                failed.append((col_idx, row_idx))
-        if failed:
-            msg = (
-                f"Origin rejected the missing-value write for these cells of "
-                f"{target}: {_cells(failed)}. They still hold the numeric 0.0 "
-                f"placeholder from the bulk write instead of a blank/missing "
-                f"value — treat that data as wrong."
-            )
-            raise ValueError(msg)
+        # Origin 2026 COM accepts the documented missing sentinel directly.
+        # Verify the actual cells; do not report success after a partial write.
+        for col_idx in sorted({c for c, _ in missing_cells}):
+            rows = [r for c, r in missing_cells if c == col_idx]
+            first, last = min(rows), max(rows)
+            block = o.GetWorksheet(target, first, col_idx, last, col_idx)
+            if not isinstance(block, (tuple, list)) or len(block) != last-first+1:
+                raise RuntimeError(f"Could not verify missing values in column {col_idx+1}; inspect {target} for partial writes.")
+            for row_idx in rows:
+                entry = block[row_idx-first]
+                if not isinstance(entry, (tuple, list)) or len(entry)!=1 or not is_origin_missing(entry[0]):
+                    raise RuntimeError(f"Missing value readback mismatch at column {col_idx+1}, row {row_idx+1}; inspect {target}.")
 
     if column_names:
         activate_window(safe_book_name, "book_name")
@@ -230,6 +230,21 @@ def get_worksheet_data(book_name: str, sheet_name: str) -> str:
     safe_book_name = labtalk_name(book_name, "book_name")
     safe_sheet_name = labtalk_name(sheet_name, "sheet_name")
     target = f"[{safe_book_name}]{safe_sheet_name}"
+    from ..originpro_backend import is_available as _originpro_available
+    if _originpro_available():
+        from ..originpro_backend import get_api
+        sheet = get_api().find_sheet('w', target)
+        if sheet is None:
+            raise ValueError(f'Worksheet {target} not found in this session.')
+        _, cols = sheet.shape
+        columns = []
+        for index in range(cols):
+            values = sheet.to_list(index)
+            columns.append([None if is_origin_missing(value) else value for value in values])
+        max_rows = max((len(column) for column in columns), default=0)
+        for column in columns:
+            column.extend([None] * (max_rows - len(column)))
+        return json.dumps({'columns': columns})
     data = o.GetWorksheet(target)
     # On failure GetWorksheet returns None or an HRESULT int, never a sequence
     if not isinstance(data, (list, tuple)):
@@ -243,7 +258,7 @@ def get_worksheet_data(book_name: str, sheet_name: str) -> str:
     def _cell(v):
         # Origin's missing-value sentinel (~1.2e308), same convention as
         # get_matrix_data / export_worksheet.
-        if isinstance(v, (int, float)) and abs(v) >= 1e100:
+        if is_origin_missing(v):
             return None
         return v
 
@@ -283,13 +298,35 @@ def _import_csv_to_worksheet_impl(
         the options.Sparklines:=0 import option ran AND left no sparkline graph
         windows behind; cannot be true while sparklines_deleted > 0>,
         "sparklines_deleted": <int, sparkline graph windows the post-import
-        cleanup still had to remove>}
+        cleanup removed>, new_graphs_to_inspect: [names]}
     """
     o = get_origin()
     path = windows_path(file_path, "file_path")
     if not os.path.isfile(path):
         msg = f"File not found: {path}"
         raise ValueError(msg)
+
+    # The OriginLab API uses its CSV Data Connector for the standard comma
+    # format. Keep custom delimiters and explicit sparkline requests on the
+    # tested legacy route; once import starts, never replay through another API.
+    if delimiter == "," and not sparklines:
+        from ..originpro_backend import is_available as _originpro_available
+        if _originpro_available():
+            from ..originpro_backend import import_csv
+            requested = labtalk_name(book_name, "book_name") if book_name else ""
+            imported = import_csv(path, requested)
+            return json.dumps({
+                "name": imported["name"],
+                "requested_name": requested or None,
+                "renamed": bool(requested) and imported["name"] != requested,
+                "file": path,
+                "rows": imported["rows"],
+                "columns": imported["columns"],
+                "sparklines_suppressed": True,
+                "sparklines_deleted": 0,
+                "new_graphs_to_inspect": [],
+                "backend": "originpro",
+            })
 
     requested_name = None
     if book_name:
@@ -331,10 +368,8 @@ def _import_csv_to_worksheet_impl(
         )
         if ok:
             sparklines_option_ok = True
-        else:
-            ok = execute_labtalk(f"impasc fname:={labtalk_path(path, 'file_path')} {delim_clause};")
     if not ok:
-        msg = f"Origin could not import {path} — check the file format and delimiter."
+        msg = f"Origin did not confirm import of {path}; it may have partially executed. Inspect the workbook before retrying."
         raise ValueError(msg)
 
     sparklines_deleted = 0
@@ -344,14 +379,16 @@ def _import_csv_to_worksheet_impl(
         # per-name `win -cd <name>;` commands, not a `win -cd %()` loop — the
         # latter is unreliable inside LabTalk loops.
         new_graphs = [g for g in graph_names() if g not in graphs_before]
-        for g in new_graphs:
-            execute_labtalk(f"win -cd {g};")
-        sparklines_deleted = len(new_graphs)
+        # New graph windows cannot be proven to be disposable sparklines;
+        # preserve them and report them for inspection.
+        unexpected_graphs = new_graphs
+    else:
+        unexpected_graphs = []
 
     # Report ACTUAL suppression, so the two telemetry fields can't contradict
     # each other (usability F12): suppression "succeeded" only when the source
     # option ran AND left no sparkline graph windows for the cleanup to remove.
-    sparklines_suppressed = sparklines_option_ok and sparklines_deleted == 0
+    sparklines_suppressed = sparklines_option_ok and not unexpected_graphs
 
     active_book = o.LTStr("page.name$")
     return json.dumps({
@@ -361,6 +398,7 @@ def _import_csv_to_worksheet_impl(
         "file": path,
         "sparklines_suppressed": sparklines_suppressed,
         "sparklines_deleted": sparklines_deleted,
+        "new_graphs_to_inspect": unexpected_graphs,
     })
 
 def _find_workbook_page(o, book_name: str):
@@ -410,6 +448,17 @@ def list_worksheets() -> str:
         JSON object: {"workbooks": [{"name", "sheets"}], "graphs": [names],
         "matrices": [names]}
     """
+    from ..originpro_backend import is_available as _originpro_available
+    if _originpro_available():
+        from ..originpro_backend import get_api
+        api = get_api()
+        return json.dumps({
+            'workbooks': [{'name': book.name,
+                           'sheets': [book[index].name for index in range(len(book))]}
+                          for book in api.pages('w')],
+            'graphs': [graph.name for graph in api.pages('g')],
+            'matrices': [book.name for book in api.pages('m')],
+        })
     o = get_origin()
     # Save the active window: enumeration activates each workbook to read its
     # sheets via LabTalk, so restore the user's active window afterward.
@@ -665,6 +714,8 @@ def export_worksheet(
 ) -> str:
     """Export a worksheet to a CSV/text file (with column headers).
 
+    UTF-8 with a BOM, so Excel opens non-ASCII headers correctly on double-click.
+
     Args:
         book_name: Workbook name
         sheet_name: Sheet name
@@ -682,8 +733,15 @@ def export_worksheet(
         msg = "delimiter must be one of: ',', 'tab', ';', '|', ' '."
         raise ValueError(msg)
     path = windows_path(file_path, "file_path")
+    if os.path.exists(path):
+        raise ValueError(f'Export destination already exists: {path}; no file was overwritten.')
     o = get_origin()
-    data = o.GetWorksheet(target)
+    from ..originpro_backend import is_available as _originpro_available
+    if _originpro_available():
+        columns = json.loads(get_worksheet_data(safe_book, safe_sheet))['columns']
+        data = list(zip(*columns)) if columns else []
+    else:
+        data = o.GetWorksheet(target)
     if not isinstance(data, (list, tuple)):
         msg = f"Could not read {target}."
         raise ValueError(msg)
@@ -700,12 +758,12 @@ def export_worksheet(
         os.makedirs(out_dir, exist_ok=True)
 
     def _cell(v):
-        if isinstance(v, (int, float)) and abs(v) >= 1e100:
+        if is_origin_missing(v):
             return ""  # Origin missing-value sentinel
         return v
 
     rows_written = 0
-    with open(path, "w", newline="", encoding="utf-8") as fh:
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.writer(fh, delimiter=sep)
         if header:
             writer.writerow(header)
@@ -778,27 +836,17 @@ def manage_columns(
     designation: str | None = None,
     formula: str | None = None,
 ) -> str:
-    """Add, delete, or edit worksheet columns.
+    """Add, delete or edit columns.
 
     Args:
-        book_name, sheet_name: Target workbook and sheet.
-        op: Which column operation to run:
-            - "add": append `count` empty columns (default 1).
-            - "delete": delete `count` columns starting at `col` (col required).
-            - "properties": set a column's metadata (col required). Uses
-              `long_name`, `units`, `comment`, and/or `designation`
-              (none/x/y/z/yerr/xerr/label); at least one is required.
-            - "formula": fill `col` from `formula` (col and formula required),
-              e.g. "col(1)^2".
-        col: Target column (1-based; required for delete/properties/formula).
-        count: Column count (op="add" or "delete"; default 1).
-        long_name, units, comment, designation: Column metadata
-            (op="properties").
-        formula: LabTalk column expression (op="formula").
-
-    Returns:
-        Success message for the selected operation.
-    """
+        book_name, sheet_name: target.
+        op: add (`count` columns), delete (`count` at `col`), properties
+            (metadata), formula (fill `col`).
+        col: 1-based (required except for add). count: default 1.
+        long_name, units, comment, designation: metadata (properties, >=1);
+            designation = none/x/y/z/yerr/xerr/label.
+        formula: LabTalk expression.
+    Returns success"""
     safe_op = labtalk_choice(op.lower(), _MANAGE_COLUMNS_OPS, "op")
     if safe_op == "add":
         return _add_columns_impl(book_name, sheet_name, count)
@@ -891,9 +939,11 @@ def _import_batch_impl(
                 {"file": f, "name": json.loads(single).get("name"), "ok": True}
             )
         except (ValueError, RuntimeError) as exc:
-            results.append({"file": f, "error": str(exc), "ok": False})
+            results.append({"file": f, "error_type": type(exc).__name__, "error": str(exc), "ok": False})
+            break
     payload = {
         "batch": True,
+        "status": "partial_failure" if any(not r['ok'] for r in results) else "success",
         "matched": matched,
         "imported": sum(1 for r in results if r["ok"]),
         "results": results,
@@ -914,41 +964,21 @@ def import_data(
     delimiter: str = ",",
     sparklines: bool = False,
 ) -> str:
-    """Import a data file into an Origin worksheet.
+    """Import a data file, directory or glob into Origin workbooks.
 
     Args:
-        file_path: Path to the file (Windows or WSL style). May ALSO be a
-            DIRECTORY or a glob pattern (e.g. C:\\data or C:\\data\\*.csv) to
-            batch-import every data file (csv/txt/dat/xls/xlsx) it matches,
-            each into its own book named from the file stem.
-        format: "auto" (detect by extension; default), "csv" (text/CSV), or
-            "excel" (.xls/.xlsx). "auto" treats .xls/.xlsx/.xlsm as Excel and
-            everything else as CSV/text.
-        book_name: Optional workbook name for the result. Ignored in batch mode
-            (each file is named from its stem).
-        delimiter: Column delimiter for CSV/text (default comma; ignored for
-            Excel).
-        sparklines: CSV/text import only. Whether to allow Origin's auto-
-            generated sparkline mini-graph windows (default False =
-            suppressed — an unsuppressed CSV import can spawn a dozen-plus
-            throwaway graph windows, bloating the project). Applied per file in
-            batch mode.
-
-    Returns:
-        Single file: JSON object {"name": <actual workbook name>,
-        "requested_name": <book_name if given, else null>, "renamed": <bool,
-        true if Origin gave the workbook a different name>, "file":
-        <file_path>}; CSV/text also adds {"sparklines_suppressed": <bool>,
-        "sparklines_deleted": <int>}.
-        Batch (directory/glob): JSON object {"batch": true, "matched": <int
-        files matched>, "imported": <int succeeded>, "results": [{"file",
-        "name"/"error", "ok"}, ...]} — partial failures are reported per file,
-        not fatal. If more than 20 files match, only the first 20 are imported
-        and a "note" says so.
-        Use the returned "name" (per-file "name" in batch mode) directly for
-        follow-up calls — it is already the actual workbook name, so there is
-        no need to call list_worksheets just to find out what Origin named it.
-    """
+        file_path: file, DIRECTORY or glob (e.g. C:\data\*.csv); matches are
+            batch-imported, each into its own book by stem.
+        format: "auto" (default, by extension), "csv" (text/CSV) or "excel"
+            (.xls/.xlsx); .xlsm counts as Excel.
+        book_name: result workbook name; IGNORED in batch mode.
+        delimiter: CSV/text delimiter (default ","); ignored for Excel.
+        sparklines: CSV/text only; default False suppresses Origin's
+            auto-generated sparkline graph windows, per file in batch.
+    Returns for one file {name,requested_name,renamed,file} (CSV adds
+    sparklines_*); for a batch {batch,matched,imported,results:[...]},
+    per-file errors not fatal, first 20 matches only. Use the returned
+    "name" as the book name."""
     if _is_batch_target(file_path):
         return _import_batch_impl(file_path, format, delimiter, sparklines)
     safe_format = labtalk_choice(format.lower(), _IMPORT_FORMATS, "format")
